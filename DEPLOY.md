@@ -1,43 +1,63 @@
-# 🚀 最终部署指南 (Zeabur + Vercel)
+# 🚀 最终部署指南 (Render + Vercel)
 
-本项目采用**前后端分离**架构。后端部署在 **Zeabur**，前端部署在 **Vercel**。两款工具均支持 GitHub 联动，**无需编写 GitHub Actions 文件**，推送到 GitHub 即可自动触发部署。
+本项目采用**前后端分离**架构。后端部署在 **Render**，前端部署在 **Vercel**，并绑定自定义域名 `eazyflow.xyz`。
 
 ---
 
 ## 📅 部署 Checklist (操作顺序)
 
-### 第一步：代码 Check-in
-- [ ] 确保代码已推送到你的 GitHub 仓库。
+### 第一步：代码托管 (GitHub)
+- [x] 确保代码已推送到 GitHub 仓库：`git@github.com:haisheng-zhang/FundAnalysis.git`
 
-### 第二步：后端部署 (Zeabur)
-1. [ ] 访问 [Zeabur](https://zeabur.com/) 并使用 GitHub 账号登录。
-2. [ ] 点击 **Create Project** -> **Deploy Service** -> **GitHub**。
-3. [ ] 选择本项目的仓库，并指定 Root Directory 为 `backend`。
-4. [ ] Zeabur 会自动识别 `requirements.txt` 并启动服务。
-5. [ ] **生成域名**: 在该服务的 "Domain" 选项卡中，生成一个免费域名（如 `fund-api.zeabur.app`）。**记录下这个地址**。
+### 第二步：后端部署 (Render)
+1. **创建服务**: 访问 [Render](https://render.com/)，选择 **New** -> **Web Service**。
+2. **连接仓库**: 授权并连接你的 GitHub 仓库。
+3. **配置参数**:
+   - **Name**: `fund-analysis-backend` (建议)
+   - **Runtime**: `Python 3`
+   - **Root Directory**: `backend` (如果仓库根目录下有 backend 文件夹)
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `uvicorn api:app --host 0.0.0.0 --port 10000`
+   - **Instance Type**: 选择 **Free**。
+4. **获取域名**: 记录部署成功后的 URL (例如 `https://xxx.onrender.com`)。
 
 ### 第三步：前端部署 (Vercel)
-1. [ ] 访问 [Vercel](https://vercel.com/) 并使用 GitHub 账号登录。
-2. [ ] 点击 **Add New** -> **Project** -> **Import** 本项目仓库。
-3. [ ] **重要配置**:
-   - **Root Directory**: 设置为 `frontend`。
-   - **Environment Variables**: 添加 `NEXT_PUBLIC_API_URL`。
-   - **Value**: 填写刚才在 Zeabur 生成的后端地址（例如 `https://fund-api.zeabur.app`，**末尾不要带斜杠**）。
-4. [ ] 点击 **Deploy**。
+1. **导入项目**: 访问 [Vercel](https://vercel.com/)，导入 GitHub 仓库。
+2. **配置框架**: 自动识别为 **Next.js**。
+3. **设置根目录**: 如果前端代码在 `frontend` 目录下，将 **Root Directory** 设置为 `frontend`。
+4. **环境变量 (关键)**: 
+   - 在 **Environment Variables** 中添加：
+     - **Key**: `NEXT_PUBLIC_API_URL`
+     - **Value**: `https://your-render-url.onrender.com` (填写第二步中获取的后端地址，末尾不要带 `/`)
+5. **执行部署**: 点击 **Deploy**。
 
-### 第四步：最终验证
-1. [ ] 访问 Vercel 生成的前端链接。
-2. [ ] 观察右上角是否显示大盘热度（若显示“连接中”，说明后端正在拉取初始数据，请等候 30s）。
+### 第四步：自定义域名配置 (Namecheap)
+
+如果你拥有域名 `eazyflow.xyz` 并想将其指向 Vercel：
+
+1. **Vercel 设置**:
+   - 进入 Vercel 项目控制面板 -> **Settings** -> **Domains**。
+   - 输入 `eazyflow.xyz` 并点击 **Add**。
+2. **Namecheap DNS 配置**:
+   - 登录 [Namecheap](https://www.namecheap.com/)，进入 **Domain List** -> **Manage** -> **Advanced DNS**。
+   - 添加以下两条记录：
+     - **Type**: `A Record` | **Host**: `@` | **Value**: `76.76.21.21` | **TTL**: `Automatic/1 min`
+     - **Type**: `CNAME Record` | **Host**: `www` | **Value**: `cname.vercel-dns.com.` | **TTL**: `Automatic/1 min`
+3. **等待生效**: DNS 生效可能需要几分钟到几小时（通常很快）。
 
 ---
 
-## 💡 为什么不需要 GitHub Actions？
+## ⚠️ 常见问题与注意事项
 
-Zeabur 和 Vercel 内部已经集成了比 GitHub Actions 更轻量、更稳定的 CI/CD 流程：
-1. **自动构建**: 只要你 `git push` 到主分支，它们会立即捕捉到代码变更并开始构建。
-2. **无需秘钥**: 它们通过 GitHub App 权限直接访问仓库，不需要你在 GitHub Secrets 中配置 API Key。
-3. **零配置部署**: 它们会自动分析项目类型（FastAPI / Next.js），自动安装依赖并分配端口。
+- **后端冷启动**: Render 免费版在 15 分钟无活跃请求后会自动休眠。首次访问网页时，后端可能需要约 30 秒进行“热身”，期间页面可能会显示加载中或数据为空。
+- **跨域 (CORS)**: 
+  - 后端 `api.py` 中必须配置 `CORSMiddleware` 以允许 Vercel 域名或自定义域名访问。
+  - 目前配置为 `allow_origins=["*"]` 以简化部署。
+- **环境变量更新**: 如果后端 URL 发生变化，必须在 Vercel 的 Settings 中更新 `NEXT_PUBLIC_API_URL` 并**重新部署 (Redeploy)** 才会生效。
+- **HTTPS**: Vercel 会自动为自定义域名配置 SSL 证书，无需手动操作。
 
-## ⚠️ 特别注意
-- **跨域 (CORS)**: 后端 `api.py` 默认已允许所有来源请求。如果部署后出现跨域问题，请检查前端环境变量地址是否拼写正确。
-- **服务常驻**: Zeabur 的免费计划支持服务持续运行，这对于本项目的行情刷新线程非常重要。
+---
+
+## 🛠 维护与日志
+- **查看后端日志**: 在 Render 控制面板的 **Logs** 标签页查看。
+- **查看前端日志**: 在 Vercel 控制面板的 **Logs** 或 **Runtime Logs** 查看。
