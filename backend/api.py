@@ -3,6 +3,8 @@ FastAPI 后端：提供基金估算 API，供前端调用。
 - 行情用应用内内存缓存，后台线程每 10 秒用 akshare 刷新，不落库。
 - 运行: uvicorn api:app --reload
 """
+import os
+import json
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -63,3 +65,29 @@ def api_search(q: str):
 def api_sentiment():
     """获取全市场行情情绪统计"""
     return get_market_sentiment()
+
+
+@app.get("/api/hot-funds")
+def api_hot_funds():
+    """ TODO: 热门基金应该以如下逻辑做：过去1个月涨幅最高的三只基金"""
+    """获取热门基金列表（静态数据，无数据库）"""
+    return [
+        {"code": "020465", "name": "招商中证半导体产业ETF联接C"},
+        {"code": "001508", "name": "富国中证红利指数增强A"},
+        {"code": "161725", "name": "招商白酒"},
+        {"code": "005827", "name": "易方达蓝筹精选混合"}
+    ]
+
+
+@app.get("/api/ai-analysis/{fund_code}")
+def api_ai_analysis(fund_code: str):
+    """获取预生成的 AI 分析报告内容"""
+    file_path = os.path.join(os.path.dirname(__file__), "data", "ai_analysis", f"{fund_code}.json")
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="该基金暂无 AI 深度分析报告")
+    
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取分析报告失败: {e}")

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { 
   Search, Star, ArrowUpRight, ArrowDownRight, 
   Info, ExternalLink, X, ShieldCheck, Clock
@@ -56,12 +56,85 @@ const styles = {
     lineHeight: 1.5,
   },
   header: {
-    marginBottom: "1.5rem",
+    marginBottom: "0.5rem",
     display: "flex",
     justifyContent: "space-between",
     alignItems: "center",
     gap: "0.5rem",
-    flexWrap: "nowrap" as const, // Never wrap to ensure visibility
+    flexWrap: "nowrap" as const,
+    padding: "0.5rem 0",
+  },
+  navLink: {
+    fontSize: "0.85rem",
+    color: "#a1a1aa",
+    textDecoration: "none",
+    fontWeight: 600,
+    display: "flex",
+    alignItems: "center",
+    gap: "0.3rem",
+    transition: "all 0.2s",
+    padding: "0.2rem 0.5rem",
+    borderRadius: "0.5rem",
+  },
+  aiBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.4rem",
+    padding: "0.3rem 0.7rem",
+    borderRadius: "2rem",
+    background: "linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%)",
+    color: "#fff",
+    fontSize: "0.8rem",
+    fontWeight: 700,
+    cursor: "pointer",
+    border: "none",
+    boxShadow: "0 0 15px rgba(139, 92, 246, 0.3)",
+    animation: "pulse 3s infinite ease-in-out",
+  },
+  hotFundItem: {
+    padding: "0.6rem 1.25rem", 
+    borderBottom: "1px solid #27272a", 
+    cursor: "pointer", 
+    display: "flex", 
+    justifyContent: "space-between", 
+    alignItems: "center",
+    fontSize: "0.85rem",
+    color: "#71717a",
+    transition: "all 0.2s",
+  },
+  aiPanel: {
+    background: "rgba(18, 18, 22, 0.8)",
+    backdropFilter: "blur(12px)",
+    border: "1px solid rgba(139, 92, 246, 0.2)",
+    borderRadius: "1rem",
+    padding: "1.25rem",
+    marginTop: "0.75rem",
+    marginBottom: "1rem",
+  },
+  aiSection: {
+    marginBottom: "1rem",
+  },
+  aiTitle: {
+    color: "#a78bfa",
+    fontSize: "0.9rem",
+    fontWeight: 800,
+    marginBottom: "0.4rem",
+    display: "flex",
+    alignItems: "center",
+    gap: "0.4rem",
+  },
+  aiContent: {
+    fontSize: "0.9rem",
+    color: "#d4d4d8",
+    lineHeight: 1.6,
+  },
+  hotFundLabel: {
+    padding: "0.75rem 1.25rem 0.25rem",
+    fontSize: "0.75rem",
+    color: "#71717a",
+    fontWeight: 700,
+    textTransform: "uppercase" as const,
+    letterSpacing: "0.05em",
   },
   title: {
     fontSize: "1.25rem", // Slightly smaller title
@@ -141,6 +214,8 @@ const styles = {
     flexWrap: "wrap" as const,
     gap: "0.5rem",
     marginBottom: "0.6rem", // Unified from 1.5rem
+    transition: "max-height 0.3s ease-out",
+    overflow: "hidden",
   },
   watchlistItem: {
     padding: "0.4rem 0.8rem",
@@ -151,6 +226,20 @@ const styles = {
     cursor: "pointer",
     color: "#a1a1aa",
     transition: "all 0.2s",
+    whiteSpace: "nowrap" as const,
+  },
+  watchlistExpandBtn: {
+    padding: "0.4rem 0.2rem",
+    background: "transparent",
+    border: "none",
+    color: "#3b82f6",
+    fontSize: "0.85rem",
+    fontWeight: 600,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    gap: "0.2rem",
+    flexShrink: 0,
   },
   footer: {
     marginTop: "2.5rem", // Reduced margin
@@ -173,7 +262,18 @@ export default function Home() {
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [showSearch, setShowSearch] = useState(false);
   const [watchlist, setWatchlist] = useState<SearchResult[]>([]);
+  const [isWatchlistExpanded, setIsWatchlistExpanded] = useState(false);
   const [mounted, setMounted] = useState(false);
+  
+  // V2 AI States
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiData, setAiData] = useState<any>(null);
+  const [aiText, setAiText] = useState("");
+  const [showAi, setShowAi] = useState(false);
+  const [hotFunds, setHotFunds] = useState<SearchResult[]>([]);
+  const searchRef = useRef<HTMLDivElement>(null);
+  const watchlistRef = useRef<HTMLDivElement>(null);
+  const [hasWatchlistOverflow, setHasWatchlistOverflow] = useState(false);
 
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
@@ -201,7 +301,80 @@ export default function Home() {
     }
     // We only call this once, it will recurse via setTimeout
     fetchSentiment();
+    fetchHotFunds();
+
+    const handleClickOutside = (event: MouseEvent) => {
+      if (searchRef.current && !searchRef.current.contains(event.target as Node)) {
+        setShowSearch(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []); // Only once on mount
+
+  // Check watchlist overflow
+  useEffect(() => {
+    const checkOverflow = () => {
+      if (watchlistRef.current) {
+        // One row is roughly 38px
+        const isOverflowing = watchlistRef.current.scrollHeight > 40;
+        setHasWatchlistOverflow(isOverflowing);
+      }
+    };
+
+    checkOverflow();
+    window.addEventListener("resize", checkOverflow);
+    return () => window.removeEventListener("resize", checkOverflow);
+  }, [watchlist]);
+
+  const fetchHotFunds = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/hot-funds`);
+      const json = await res.json();
+      setHotFunds(json);
+    } catch (e) {}
+  };
+
+  const fetchAiAnalysis = async (fundCode: string) => {
+    if (showAi && aiData?.fund_code === fundCode) {
+      setShowAi(false);
+      return;
+    }
+    
+    setAiLoading(true);
+    setAiText("");
+    setShowAi(true);
+    
+    try {
+      const res = await fetch(`${API_BASE}/api/ai-analysis/${fundCode}`);
+      if (!res.ok) throw new Error("No AI data");
+      const json = await res.json();
+      setAiData(json);
+      
+      // Simulate Typing Effect (Chunk-based)
+      let fullText = "";
+      json.analysis.forEach((section: any) => {
+        fullText += `### ${section.title}\n${section.content}\n\n`;
+      });
+      
+      let currentIdx = 0;
+      const step = 8; // Typing speed (chars per tick)
+      const timer = setInterval(() => {
+        if (currentIdx >= fullText.length) {
+          clearInterval(timer);
+          return;
+        }
+        setAiText(fullText.substring(0, currentIdx + step));
+        currentIdx += step;
+      }, 30);
+      
+    } catch (e) {
+      setAiData(null);
+      setAiText("⚠️ 该基金暂无预生成的 AI 深度分析报告。我们正在加紧覆盖更多热门基金...");
+    } finally {
+      setAiLoading(false);
+    }
+  };
 
   const handleSearch = useCallback(async (q: string) => {
     if (q.length < 2) {
@@ -283,36 +456,19 @@ export default function Home() {
           <ShieldCheck size={24} color="#3b82f6" />
           基金透视
         </h1>
-        
-        {sentiment ? (
-          sentiment.status === "ok" ? (
-            <div style={styles.heatBarContainer}>
-              <span style={{ fontSize: "0.75rem", color: "#ef4444", fontWeight: 800 }}>{sentiment.up}</span>
-              <div style={styles.heatBar}>
-                <div style={{ width: `${upRatio}%`, background: "linear-gradient(90deg, #ef4444, #f87171)" }}></div>
-                <div style={{ width: `${100 - upRatio}%`, background: "linear-gradient(90deg, #34d399, #10b981)" }}></div>
-              </div>
-              <span style={{ fontSize: "0.75rem", color: "#10b981", fontWeight: 800 }}>{sentiment.down}</span>
-              <div style={{ width: "1px", height: "12px", background: "#3f3f46", margin: "0 2px" }}></div>
-              <div style={{ display: "flex", alignItems: "center", gap: "0.2rem", color: "#71717a", fontSize: "0.7rem", fontWeight: 500 }}>
-                <Clock size={12} />
-                {getSmartTimeLabel()}
-              </div>
-            </div>
-          ) : (
-            <div style={{ ...styles.heatBarContainer, opacity: 0.6 }}>
-              <span style={{ fontSize: "0.65rem", color: "#71717a" }}>行情加载中...</span>
-            </div>
-          )
-        ) : (
-          <div style={{ ...styles.heatBarContainer, opacity: 0.6 }}>
-            <span style={{ fontSize: "0.65rem", color: "#71717a" }}>连接中...</span>
-          </div>
-        )}
+
+        <nav style={{ display: "flex", alignItems: "center", gap: "0.8rem" }}>
+          <a href="#" style={styles.navLink} onClick={(e) => { e.preventDefault(); alert("敬请期待：基金基础知识扫盲计划"); }}>
+            基金入门
+          </a>
+          <a href="#" style={styles.navLink} onClick={(e) => { e.preventDefault(); alert("市场观点功能正在开发中，敬请期待！"); }}>
+            市场观点
+          </a>
+        </nav>
       </header>
 
       {/* Search */}
-      <div style={styles.inputContainer}>
+      <div style={styles.inputContainer} ref={searchRef}>
         <div style={{ position: "absolute", left: "1.1rem", top: "50%", transform: "translateY(-50%)", color: "#52525b" }}>
           <Search size={20} />
         </div>
@@ -324,16 +480,37 @@ export default function Home() {
             setCode(e.target.value);
             handleSearch(e.target.value);
           }}
-          onFocus={() => code.length >= 2 && setShowSearch(true)}
+          onFocus={(e) => {
+            e.target.select();
+            setShowSearch(true);
+          }}
         />
         
-        {showSearch && searchResults.length > 0 && (
+        {showSearch && (searchResults.length > 0 || code === "") && (
           <div style={{
             position: "absolute", top: "100%", left: 0, right: 0,
             background: "#18181b", border: "1px solid #27272a", borderRadius: "0.75rem",
             marginTop: "0.5rem", zIndex: 10, maxHeight: "320px", overflowY: "auto",
             boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.5)"
           }}>
+            {code === "" && hotFunds.length > 0 && (
+              <>
+                <div style={styles.hotFundLabel}>最近热门基金</div>
+                {hotFunds.map((f) => (
+                  <div 
+                    key={f.code}
+                    style={styles.hotFundItem}
+                    onClick={() => { fetchFund(f); setShowSearch(false); }}
+                  >
+                    <div>
+                      <span style={{ marginRight: "0.6rem" }}>{f.code}</span>
+                      <span>{f.name}</span>
+                    </div>
+                  </div>
+                ))}
+                <div style={{ ...styles.hotFundLabel, borderTop: "1px solid #27272a", marginTop: "0.2rem", paddingTop: "0.5rem" }}>搜索结果</div>
+              </>
+            )}
             {searchResults.map((f) => (
               <div 
                 key={f.code}
@@ -354,12 +531,30 @@ export default function Home() {
       </div>
 
       {watchlist.length > 0 && (
-        <div style={styles.watchlist}>
-          {watchlist.map(f => (
-            <div key={f.code} style={styles.watchlistItem} onClick={() => fetchFund(f)}>
-              {f.name}
-            </div>
-          ))}
+        <div style={{ display: "flex", alignItems: "flex-start", gap: "0.2rem", marginBottom: "0.6rem" }}>
+          <div 
+            ref={watchlistRef}
+            style={{
+              ...styles.watchlist,
+              marginBottom: 0,
+              maxHeight: isWatchlistExpanded ? "1000px" : "38px",
+              flex: 1,
+            }}
+          >
+            {watchlist.map(f => (
+              <div key={f.code} style={styles.watchlistItem} onClick={() => fetchFund(f)}>
+                {f.name}
+              </div>
+            ))}
+          </div>
+          {(hasWatchlistOverflow || isWatchlistExpanded) && (
+            <button 
+              style={styles.watchlistExpandBtn}
+              onClick={() => setIsWatchlistExpanded(!isWatchlistExpanded)}
+            >
+              {isWatchlistExpanded ? "收起" : "..."}
+            </button>
+          )}
         </div>
       )}
 
@@ -382,17 +577,50 @@ export default function Home() {
             <div style={{ display: "flex", width: "100%", alignItems: "center" }}>
               {/* Left Column: 75% */}
               <div style={{ width: "75%", textAlign: "left" }}>
-                <h2 style={{ fontSize: "1.1rem", fontWeight: 800, color: "#fff", letterSpacing: "-0.01em", marginBottom: "0.1rem" }}>
-                  {data.fund_name || "华夏成长"}
-                </h2>
-                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                <a 
+                  href={`https://fund.eastmoney.com/${data.fund_code}.html`} 
+                  target="_blank" 
+                  style={{ 
+                    textDecoration: "none", 
+                    color: "#3b82f6",
+                    fontSize: "1.1rem", 
+                    fontWeight: 800, 
+                    letterSpacing: "-0.01em",
+                    display: "inline",
+                    lineHeight: 1.2
+                  }}
+                >
+                  {data.fund_name || "未知基金"}
+                  <ExternalLink 
+                    size={14} 
+                    color="currentColor" 
+                    style={{ 
+                      display: "inline-block", 
+                      verticalAlign: "middle", 
+                      marginLeft: "4px",
+                      opacity: 0.8,
+                      position: "relative",
+                      top: "-1px"
+                    }} 
+                  />
+                </a>
+                <div style={{ display: "flex", alignItems: "center", gap: "0.8rem", marginTop: "0.4rem" }}>
                   <span style={{ color: "#71717a", fontWeight: 600, fontSize: "1.05rem" }}>{data.fund_code}</span>
-                  <div 
-                    onClick={() => toggleWatchlist({ code: data.fund_code, name: data.fund_name || "华夏成长" })} 
-                    style={{ cursor: "pointer", display: "flex", alignItems: "center" }}
-                  >
-                    {watchlist.find(w => w.code === data.fund_code) ? <Star size={18} fill="#f59e0b" color="#f59e0b" /> : <Star size={18} color="#3f3f46" />}
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
+                    <div 
+                      onClick={() => toggleWatchlist({ code: data.fund_code, name: data.fund_name || "未知基金" })} 
+                      style={{ cursor: "pointer", display: "flex", alignItems: "center" }}
+                    >
+                      {watchlist.find(w => w.code === data.fund_code) ? <Star size={20} fill="#f59e0b" color="#f59e0b" /> : <Star size={20} color="#3f3f46" />}
+                    </div>
                   </div>
+                  
+                  <button 
+                    style={styles.aiBtn} 
+                    onClick={() => fetchAiAnalysis(data.fund_code)}
+                  >
+                    ✨ AI 分析报告
+                  </button>
                 </div>
               </div>
 
@@ -410,6 +638,41 @@ export default function Home() {
               </div>
             </div>
           </div>
+
+          {/* AI Analysis Panel */}
+          {showAi && (
+            <div style={styles.aiPanel}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", color: "#a78bfa", fontWeight: 800 }}>
+                  <ShieldCheck size={20} /> AI 深度解读分析报告
+                </div>
+                <div style={{ fontSize: "0.75rem", color: "#71717a" }}>
+                  {aiData?.update_date ? `更新于 ${aiData.update_date}` : "离线预生成"}
+                </div>
+              </div>
+              
+              {aiLoading ? (
+                <div style={{ color: "#71717a", fontSize: "0.9rem", fontStyle: "italic" }}>
+                  正在连接云端大脑，调取深度分析报告...
+                </div>
+              ) : (
+                <div style={{ ...styles.aiContent, whiteSpace: "pre-wrap" }}>
+                  {aiText.split("### ").map((section, idx) => {
+                    if (!section) return null;
+                    const lines = section.split("\n");
+                    const title = lines[0];
+                    const content = lines.slice(1).join("\n");
+                    return (
+                      <div key={idx} style={styles.aiSection}>
+                        <div style={styles.aiTitle}>{title}</div>
+                        <div style={styles.aiContent}>{content}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Table Card */}
           <div style={{ ...styles.card, padding: "0.25rem 0.5rem" }}>
@@ -463,8 +726,9 @@ export default function Home() {
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem", fontSize: "0.85rem" }}>
           <p style={{ margin: 0 }}>1. <strong>非官方数据</strong>：本工具仅根据基金季度报告披露的十大重仓股及实时行情进行数学估算，不代表基金真实净值，不构成投资建议。</p>
-          <p style={{ margin: 0 }}>2. <strong>局限性说明</strong>：估算未考虑重仓股以外的持仓、现金比例、调仓变动及管理成本。请以官方每日发布的净值为准。</p>
-          <p style={{ margin: 0 }}>3. <strong>风险提示</strong>：市场有风险，投资需谨慎。本程序不对任何投资损益负责。</p>
+          <p style={{ margin: 0 }}>2. <strong>AI生成声明</strong>：深度解读内容由 AI 预生成，仅供研究参考，不代表本平台立场。<strong>AI生成，仅供参考。</strong></p>
+          <p style={{ margin: 0 }}>3. <strong>局限性说明</strong>：估算未考虑重仓股以外的持仓、现金比例、调仓变动及管理成本。请以官方每日发布的净值为准。</p>
+          <p style={{ margin: 0 }}>4. <strong>风险提示</strong>：市场有风险，投资需谨慎。本程序不对任何投资损益负责。</p>
         </div>
         <div style={{ marginTop: "2rem", textAlign: "center" }}>
           <a href="https://github.com/akfamily/akshare" target="_blank" style={{ color: "#3b82f6", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "0.4rem", fontWeight: 600 }}>
@@ -476,6 +740,11 @@ export default function Home() {
       <style dangerouslySetInnerHTML={{ __html: `
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes pulse {
+          0% { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.4); transform: scale(1); }
+          70% { box-shadow: 0 0 0 10px rgba(139, 92, 246, 0); transform: scale(1.02); }
+          100% { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0); transform: scale(1); }
+        }
         body { background: #0a0a0c; margin: 0; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
         input::placeholder { color: #3f3f46; }
         ::-webkit-scrollbar { width: 6px; }
