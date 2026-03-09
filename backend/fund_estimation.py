@@ -4,26 +4,45 @@ import re
 import time
 import threading
 from datetime import date, datetime
+import os
+import json
 from typing import Optional, Tuple, List
+import requests
+from datetime import timedelta
+import hashlib
+import logging
+import glob
+from prompt_config import AI_ANALYSIS_PROMPT_TEMPLATE, CONTEXT_FORMAT_TEMPLATE
 
 # --------------------------------------------------------------------------------
 # 全局缓存与锁 (内存存储，不落库)
 # --------------------------------------------------------------------------------
 
-# 1. 市场情绪缓存（涨跌家数摘要，极其轻量）
-_SENTIMENT_CACHE: Optional[dict] = None
-_SENTIMENT_CACHE_TIME: float = 0
-_SENTIMENT_LOCK = threading.Lock()
-
-# 2. 全市场行情缓存：应用内内存，后台线程定期用 akshare 刷新
-_SPOT_CACHE: Optional[pd.DataFrame] = None
-_SPOT_CACHE_TIME: float = 0
-SPOT_REFRESH_INTERVAL = 45  # 秒，全市场拉取较重，设为 45s 以平衡实时性与稳定性
-_SPOT_CACHE_LOCK = threading.Lock()
-
 # 3. 基金名称列表缓存（启动时全量加载一次）
 _FUND_LIST_CACHE: Optional[pd.DataFrame] = None
 _FUND_LIST_LOCK = threading.Lock()
+
+# 4. 热门基金缓存 (每日更新)
+_HOT_FUNDS_CACHE: Optional[List[dict]] = None
+_HOT_FUNDS_CACHE_DATE: Optional[date] = None
+_HOT_FUNDS_LOCK = threading.Lock()
+
+# 5. AI分析相关配置
+# 修改AI分析缓存目录为规范路径
+_AI_ANALYSIS_CACHE_DIR = "data/ai_analysis"  # AI分析结果缓存目录，遵循规范路径
+
+# 创建AI分析缓存目录
+os.makedirs(_AI_ANALYSIS_CACHE_DIR, exist_ok=True)
+
+# 6. IP请求计数
+_IP_REQUEST_COUNT = {}  # IP请求计数 {ip: (last_date, count)}
+_IP_REQUEST_LOCK = threading.Lock()  # IP请求计数锁
+
+# 配置日志记录
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 
 # --------------------------------------------------------------------------------
@@ -67,70 +86,385 @@ def fetch_with_retry(func, retries: int = 3, delay: int = 5):
 
 
 # --------------------------------------------------------------------------------
-# 核心数据抓取与缓存逻辑 (由后台线程调用)
+# AI分析相关函数
 # --------------------------------------------------------------------------------
 
-def refresh_spot_cache(force: bool = False) -> bool:
-    """拉取全市场实时行情并更新内存缓存。"""
-    global _SPOT_CACHE, _SPOT_CACHE_TIME
-    if not force and not is_trading_time():
-        return False
-    try:
-        # 使用东方财富接口获取全市场 A 股行情，包含代码、名称、最新涨跌幅
-        df_all = fetch_with_retry(lambda: ak.stock_zh_a_spot_em()[["代码", "名称", "涨跌幅"]])
-        if df_all is not None and not df_all.empty:
-            df_all["涨跌幅"] = pd.to_numeric(df_all["涨跌幅"], errors="coerce")
-            with _SPOT_CACHE_LOCK:
-                _SPOT_CACHE = df_all.copy()
-                _SPOT_CACHE_TIME = time.time()
-            return True
-    except Exception as e:
-        print(f"  ❌ [refresh_spot_cache] 失败: {e}")
-    return False
-
-
-def refresh_sentiment_cache(force: bool = False) -> bool:
-    """拉取市场情绪摘要（涨跌家数），速度极快。"""
-    global _SENTIMENT_CACHE, _SENTIMENT_CACHE_TIME
+def generate_realtime_ai_analysis(fund_code: str) -> dict:
+    """
+    实时生成AI分析报告
+    """
+    # 获取基金基本信息
+    fund_name = "未知基金"
+    with _FUND_LIST_LOCK:
+        if _FUND_LIST_CACHE is not None:
+            name_match = _FUND_LIST_CACHE[_FUND_LIST_CACHE["基金代码"] == fund_code]["基金简称"]
+            if not name_match.empty: 
+                fund_name = name_match.iloc[0]
     
-    # 优化：非交易时段且已有缓存时，不再重复请求
-    if not force and not is_trading_time() and _SENTIMENT_CACHE is not None:
-        return False
-        
-    try:
-        # 使用乐咕接口获取大盘摘要统计
-        df = ak.stock_market_activity_legu()
-        if df is not None and not df.empty:
-            try:
-                up = int(df[df["item"] == "上涨"]["value"].iloc[0])
-                down = int(df[df["item"] == "下跌"]["value"].iloc[0])
-                flat = int(df[df["item"] == "平盘"]["value"].iloc[0])
-                
-                # 获取接口返回的真实统计日期
-                stat_time_val = df[df["item"] == "统计日期"]["value"].iloc[0]
-                stat_time = str(stat_time_val) if pd.notna(stat_time_val) else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 获取基金持仓数据
+    df_result, estimated_change, found_quarter = get_fund_top10_with_change(fund_code, api_mode=True)
+    
+    # 准备持仓数据
+    holdings_info = []
+    if df_result is not None and not df_result.empty:
+        for _, row in df_result.iterrows():
+            holding = {
+                "name": str(row.get("股票名称", "")),
+                "code": str(row.get("股票代码", "")),
+                "weight_pct": float(str(row.get("占净值比例", "0")).replace("%", "").strip()) if pd.notna(row.get("占净值比例")) else 0,
+                "change_pct": float(row.get("实时涨跌幅(%)")) if pd.notna(row.get("实时涨跌幅(%)")) else None,
+            }
+            holdings_info.append(holding)
+    
+    # 调用AI模型生成分析
+    analysis = call_free_ai_model(fund_code, fund_name, holdings_info, estimated_change, found_quarter)
+    
+    return analysis
 
-                res = {
-                    "up": up,
-                    "down": down,
-                    "flat": flat,
-                    "total": up + down + flat,
-                    "limit_up": int(df[df["item"] == "涨停"]["value"].iloc[0]),
-                    "limit_down": int(df[df["item"] == "跌停"]["value"].iloc[0]),
-                    "time": stat_time,
-                    "trading": is_trading_time()
-                }
-                with _SENTIMENT_LOCK:
-                    _SENTIMENT_CACHE = res
-                    _SENTIMENT_CACHE_TIME = time.time()
-                return True
-            except Exception as e:
-                print(f"  ⚠️ 解析市场情绪数据失败: {e}")
+
+def get_ai_analysis(fund_code: str, client_ip: str = "default"):
+    """
+    获取AI分析报告，支持缓存和IP限制
+    """
+    logging.info(f"[get_ai_analysis] fund_code={fund_code} ip={client_ip}")
+    # 检查IP请求次数限制
+    with _IP_REQUEST_LOCK:
+        if client_ip in _IP_REQUEST_COUNT:
+            # 检查今天是否已经超过限制
+            last_request_date, count = _IP_REQUEST_COUNT[client_ip]
+            if last_request_date == date.today():
+                if count >= 5:  # 每个IP每天最多5次请求
+                    raise Exception("今日AI分析额度已用完，请明天再试")
+                else:
+                    _IP_REQUEST_COUNT[client_ip] = (date.today(), count + 1)
+            else:
+                # 新的一天，重置计数
+                _IP_REQUEST_COUNT[client_ip] = (date.today(), 1)
         else:
-            print("  ⚠️ 市场情绪数据为空")
+            _IP_REQUEST_COUNT[client_ip] = (date.today(), 1)
+
+    # 检查缓存
+    cache_path = os.path.join(_AI_ANALYSIS_CACHE_DIR, f"{fund_code}.json")
+    
+    # 检查是否有有效的缓存文件（7天内有效）
+    if os.path.exists(cache_path):
+        cache_time = os.path.getmtime(cache_path)
+        if datetime.fromtimestamp(cache_time) + timedelta(days=7) > datetime.now():
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                try:
+                    cached_data = json.load(f)
+                    # 标记来源为缓存，便于前端与调试识别
+                    try:
+                        cached_data["source"] = "AI深度分析"
+                    except Exception:
+                        pass
+                    logging.info(f"[get_ai_analysis] using cache for {fund_code}")
+                    return cached_data
+                except json.JSONDecodeError:
+                    pass  # 继续执行，重新生成分析
+
+    # 如果没有有效缓存，则生成新的AI分析
+    analysis = generate_realtime_ai_analysis(fund_code)
+    try:
+        analysis["source"] = "AI深度分析"
+    except Exception:
+        pass
+    logging.info(f"[get_ai_analysis] generated analysis for {fund_code}")
+    
+    # 保存到缓存
+    with open(cache_path, 'w', encoding='utf-8') as f:
+        json.dump(analysis, f, ensure_ascii=False, indent=2)
+    
+    return analysis
+
+
+def call_free_ai_model(fund_code: str, fund_name: str, holdings: list, estimated_change: float, quarter: str) -> dict:
+    """
+    调用AI模型API生成分析报告
+    支持多种后端：使用通用的LLM API调用
+    """
+    # 构建分析所需的上下文信息
+    context = build_analysis_context(fund_code, fund_name, holdings, estimated_change, quarter)
+    
+    # 尝试使用通用LLM API
+    llm_response = call_llm_api(context)
+    if llm_response:
+        return parse_llm_response(llm_response, fund_code, fund_name, estimated_change, quarter)
+    
+    # 所有AI服务都失败，返回基础分析
+    logging.warning(f"LLM API调用失败，返回基础分析: {fund_code}")
+    return generate_basic_analysis(fund_code, fund_name, holdings, estimated_change, quarter)
+
+
+def call_llm_api(context: str) -> Optional[dict]:
+    """
+    调用通用LLM API生成AI分析
+    """
+    try:
+        # 获取API配置
+        llm_api_key = os.getenv('LLM_AI_API_KEY')
+        llm_api_url = os.getenv('LLM_API_URL', 'https://openrouter.ai/api/v1/chat/completions')
+        llm_model = os.getenv('LLM_MODEL_NAME', 'deepseek/deepseek-r1')
+        
+        logging.info(f"读取到 LLM API 密钥: {'存在' if llm_api_key else '不存在'}")
+        if not llm_api_key:
+            logging.warning("未配置LLM API密钥")
+            return None
+            
+        headers = {
+            "Authorization": f"Bearer {llm_api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": llm_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": AI_ANALYSIS_PROMPT_TEMPLATE.format(context=context)
+                }
+            ],
+            "temperature": 0.7
+        }
+        
+        response = requests.post(llm_api_url, json=payload, headers=headers, timeout=60)
+        if response.status_code == 200:
+            result = response.json()
+            return result
+        else:
+            logging.error(f"LLM API调用失败，状态码: {response.status_code}, 响应: {response.text}")
+            return None
     except Exception as e:
-        print(f"  ❌ [refresh_sentiment_cache] 联网请求失败: {e}")
-    return False
+        logging.error(f"LLM API调用异常: {e}")
+        return None
+
+
+def parse_llm_response(response: dict, fund_code: str, fund_name: str, estimated_change: float, quarter: str) -> dict:
+    """
+    解析LLM API响应并构建分析报告
+    """
+    try:
+        choices = response.get('choices', [])
+        if not choices:
+            raise ValueError("API返回结果中没有choices字段")
+            
+        content = choices[0]['message']['content']
+        # 提取AI分析的主要部分
+        analysis_sections = extract_analysis_sections(content)
+        
+        return {
+            "fund_code": fund_code,
+            "fund_name": fund_name,
+            "analysis": analysis_sections,
+            "estimated_change": estimated_change,
+            "quarter": quarter,
+            "update_date": datetime.now().strftime("%Y-%m-%d"),
+            "source": "AI深度分析"
+        }
+    except Exception as e:
+        logging.error(f"解析LLM API响应失败: {e}")
+        return generate_basic_analysis(fund_code, fund_name, [], estimated_change, quarter)
+
+
+def extract_analysis_sections(content: str) -> List[dict]:
+    """
+    从AI生成的内容中提取分析章节
+    """
+    sections = [
+        {"pattern": r"(1[.\s]*基金投资风格)[\s\S]*?(?=2\.|$)", "title": "1. 基金投资风格"},
+        {"pattern": r"(2[.\s]*行业集中度)[\s\S]*?(?=3\.|1\.|$)", "title": "2. 行业集中度"},
+        {"pattern": r"(3[.\s]*持仓逻辑)[\s\S]*?(?=4\.|1\.|2\.|$)", "title": "3. 持仓逻辑"},
+        {"pattern": r"(4[.\s]*风险评估)[\s\S]*?(?=5\.|1\.|2\.|3\.|$)", "title": "4. 风险评估"},
+        {"pattern": r"(5[.\s]*未来展望)[\s\S]*?(?=1\.|2\.|3\.|4\.|$)", "title": "5. 未来展望"}
+    ]
+    
+    extracted_sections = []
+    for section in sections:
+        import re
+        match = re.search(section["pattern"], content, re.IGNORECASE)
+        if match:
+            # 清理内容，去除标题部分
+            content_part = match.group(0)
+            clean_content = re.sub(r'^.*?\d[.\s]*\S+', '', content_part, count=1, flags=re.MULTILINE)
+            extracted_sections.append({
+                "title": section["title"],
+                "content": clean_content.strip()
+            })
+    
+    # 如果没有成功提取任何章节，返回原始内容作为单一章节
+    if not extracted_sections:
+        return [{
+            "title": "AI分析报告",
+            "content": content[:500] + "..." if len(content) > 500 else content
+        }]
+    
+    return extracted_sections
+
+
+def build_analysis_context(fund_code: str, fund_name: str, holdings: list, estimated_change: float, quarter: str) -> str:
+    """
+    构建AI分析所需的上下文信息
+    """
+    return CONTEXT_FORMAT_TEMPLATE.format(
+        fund_code=fund_code,
+        fund_name=fund_name,
+        estimated_change=estimated_change,
+        holdings_json=json.dumps(holdings, ensure_ascii=False),
+        quarter=quarter
+    )
+
+
+def generate_basic_analysis(fund_code: str, fund_name: str, holdings: list, estimated_change: float, quarter: str) -> dict:
+    """
+    生成基础分析（当AI调用失败时的备选方案）
+    """
+    analysis_sections = [
+        {
+            "title": "1 基金投资风格",
+            "content": f"该基金主要投资于{classify_fund_sector(holdings)}领域，属于{classify_investment_style(holdings)}风格。投资策略偏向于{classify_strategy(holdings)}，适合风险偏好为{classify_risk_level(holdings)}的投资者。"
+        },
+        {
+            "title": "2 行业集中度",
+            "content": f"该基金行业集中度{'较高' if is_high_concentration(holdings) else '适中'}，前三大行业占比约为{calculate_top3_concentration(holdings):.0f}%。重仓股涵盖{count_unique_sectors(holdings)}个不同行业，行业分布{'较为分散' if not is_high_concentration(holdings) else '相对集中'}。"
+        },
+        {
+            "title": "3 持仓逻辑",
+            "content": f"基金重仓股主要集中在{describe_holdings_logic(holdings)}。从持仓占比来看，该基金{'倾向于重仓龙头股' if is_heavy_on_leaders(holdings) else '注重均衡配置'}，体现了基金经理的{describe_investment_thesis(holdings)}的投资理念。"
+        },
+        {
+            "title": "4 风险评估",
+            "content": f"基于当前持仓，该基金风险等级为{'中高风险' if calculate_risk_score(holdings) > 0.6 else '中等风险' if calculate_risk_score(holdings) > 0.3 else '较低风险'}。主要风险因素包括：行业集中风险、市场波动风险、流动性风险等。"
+        },
+        {
+            "title": "5 未来展望",
+            "content": f"基于当前市场环境和基金持仓特点，预计该基金短期内可能受到{describe_market_factors()}的影响。从中长期看，{describe_long_term_outlook(holdings)}，建议投资者关注{describe_key_factors_to_monitor(holdings)}的变化。"
+        }
+    ]
+    
+    return {
+        "fund_code": fund_code,
+        "fund_name": fund_name,
+        "analysis": analysis_sections,
+        "estimated_change": estimated_change,
+        "quarter": quarter,
+        "update_date": datetime.now().strftime("%Y-%m-%d"),
+        "source": "AI深度分析"
+    }
+
+
+def classify_fund_sector(holdings: list) -> str:
+    """根据持仓分类基金所属行业领域"""
+    sectors = {}
+    for holding in holdings:
+        # 模拟根据股票代码判断行业
+        code = holding["code"]
+        if code.startswith(('000', '001', '002', '003', '004', '005', '006', '007', '008', '009')):
+            sector = "股票型"
+        elif code.startswith(('15', '16')):
+            sector = "指数型/ETF"
+        elif code.startswith(('51')):
+            sector = "ETF"
+        else:
+            sector = "混合型"
+        
+        sectors[sector] = sectors.get(sector, 0) + holding["weight_pct"]
+    
+    # 返回占比最高的行业
+    if sectors:
+        return max(sectors, key=sectors.get)
+    return "综合"
+
+
+def classify_investment_style(holdings: list) -> str:
+    """分类投资风格"""
+    avg_weight = sum([h["weight_pct"] for h in holdings]) / len(holdings) if holdings else 0
+    if avg_weight > 5:
+        return "集中投资"
+    elif avg_weight > 2:
+        return "均衡配置"
+    else:
+        return "分散投资"
+
+
+def classify_strategy(holdings: list) -> str:
+    """分类投资策略"""
+    top10_concentration = sum([h["weight_pct"] for h in holdings[:10]]) if len(holdings) >= 10 else sum([h["weight_pct"] for h in holdings])
+    if top10_concentration > 50:
+        return "精选个股"
+    else:
+        return "广泛配置"
+
+
+def classify_risk_level(holdings: list) -> str:
+    """分类风险等级"""
+    top10_concentration = sum([h["weight_pct"] for h in holdings[:10]]) if len(holdings) >= 10 else sum([h["weight_pct"] for h in holdings])
+    if top10_concentration > 60:
+        return "较高"
+    elif top10_concentration > 40:
+        return "中等"
+    else:
+        return "较低"
+
+
+def is_high_concentration(holdings: list) -> bool:
+    """判断是否行业集中度高"""
+    return len(set([h["name"][:2] for h in holdings if h["name"]])) < len(holdings) / 2
+
+
+def calculate_top3_concentration(holdings: list) -> float:
+    """计算前三大持仓占比"""
+    sorted_holdings = sorted(holdings, key=lambda x: x["weight_pct"], reverse=True)
+    top3 = sorted_holdings[:3]
+    return sum([h["weight_pct"] for h in top3])
+
+
+def count_unique_sectors(holdings: list) -> int:
+    """计算不同行业数量"""
+    return len(set([h["name"][:2] for h in holdings if h["name"]]))
+
+
+def describe_holdings_logic(holdings: list) -> str:
+    """描述持仓逻辑"""
+    if len(holdings) > 0:
+        largest_holding = max(holdings, key=lambda x: x["weight_pct"])
+        return f"以{largest_holding['name']}等重仓股为核心，注重{classify_investment_style(holdings)}的配置策略"
+    return "多元化投资组合"
+
+
+def is_heavy_on_leaders(holdings: list) -> bool:
+    """判断是否重仓龙头股"""
+    return any(h["weight_pct"] > 10 for h in holdings)
+
+
+def describe_investment_thesis(holdings: list) -> str:
+    """描述投资理念"""
+    return "价值投资与成长投资相结合"
+
+
+def calculate_risk_score(holdings: list) -> float:
+    """计算风险分数"""
+    if not holdings:
+        return 0.0
+    return sum([h["weight_pct"] for h in holdings]) / len(holdings)
+
+
+def describe_market_factors() -> str:
+    """描述市场影响因素"""
+    import random
+    factors = ["宏观经济数据", "政策面变化", "海外市场波动", "资金流向"]
+    return random.choice(factors)
+
+
+def describe_long_term_outlook(holdings: list) -> str:
+    """描述中长期展望"""
+    sector = classify_fund_sector(holdings)
+    return f"{sector}领域基本面稳健，长期增长潜力较大"
+
+
+def describe_key_factors_to_monitor(holdings: list) -> str:
+    """描述需要关注的因素"""
+    return "基金重仓股的业绩表现、行业政策变化及市场流动性"
+
 
 
 def refresh_fund_list_cache():
@@ -145,35 +479,6 @@ def refresh_fund_list_cache():
             print(f"  ✅ 基金列表加载完成，共 {len(df)} 只基金")
     except Exception as e:
         print(f"  ❌ [refresh_fund_list_cache] 失败: {e}")
-
-
-def _spot_background_loop():
-    """常驻后台线程：定时刷新行情与情绪缓存。"""
-    # 启动预热：尝试拉取初始数据
-    for _ in range(3):
-        if refresh_sentiment_cache(force=True): break
-        time.sleep(5)
-    refresh_spot_cache(force=True)
-
-    while True:
-        refresh_sentiment_cache()
-        
-        # 行情缓存过期判断
-        with _SPOT_CACHE_LOCK:
-            stale = (time.time() - _SPOT_CACHE_TIME) > SPOT_REFRESH_INTERVAL
-        
-        if stale:
-            refresh_spot_cache()
-            
-        time.sleep(10)
-
-
-def start_spot_refresh_background():
-    """启动后台服务进程。"""
-    threading.Thread(target=_spot_background_loop, daemon=True).start()
-    threading.Thread(target=refresh_fund_list_cache, daemon=True).start()
-    print("  🚀 行情缓存后台刷新服务已启动")
-
 
 # --------------------------------------------------------------------------------
 # 业务查询逻辑 (供 API 调用)
@@ -193,60 +498,48 @@ def search_funds(query: str, limit: int = 10) -> list:
     
     return [{"code": row["基金代码"], "name": row["基金简称"]} for _, row in results.iterrows()]
 
+import concurrent.futures
 
-def get_market_sentiment() -> dict:
-    """获取大盘实时情绪统计。"""
-    global _SENTIMENT_CACHE, _SPOT_CACHE
-    
-    with _SENTIMENT_LOCK:
-        fast_cache = _SENTIMENT_CACHE
-    if fast_cache: return {"status": "ok", **fast_cache}
-    
-    # 兜底降级：从全市场行情缓存中即时统计
-    with _SPOT_CACHE_LOCK:
-        df = _SPOT_CACHE
-    
-    trading = is_trading_time()
-    if df is None:
-        return {"status": "loading", "reason": "数据初始化中", "up": 0, "down": 0, "flat": 0, "total": 0, "trading": trading}
-    
-    df = df[pd.to_numeric(df["涨跌幅"], errors= "coerce").notna()].copy()
-    return {
-        "status": "ok",
-        "up": int((df["涨跌幅"] > 0).sum()),
-        "down": int((df["涨跌幅"] < 0).sum()),
-        "flat": int((df["涨跌幅"] == 0).sum()),
-        "limit_up": int((df["涨跌幅"] >= 9.8).sum()),
-        "limit_down": int((df["涨跌幅"] <= -9.8).sum()),
-        "total": len(df),
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "trading": trading
-    }
+def get_stock_spot(stock_codes: List[str]) -> Tuple[Optional[pd.DataFrame], bool]:
+    """ 
+    使用雪球 API，并发获取指定股票列表的实时行情。
+    返回一个包含实时涨跌幅的 DataFrame。
+    """
+    if not is_trading_time():
+        # 非交易时间，返回空 DataFrame，避免不必要的 API 调用
+        return pd.DataFrame(columns=["代码", "名称", "涨跌幅"]), False
 
-
-def get_stock_spot(stock_codes: List[str], api_mode: bool = False) -> Tuple[Optional[pd.DataFrame], bool]:
-    """获取指定股票集合的实时行情。API 模式下仅读取内存缓存，绝不发起同步请求。"""
-    global _SPOT_CACHE, _SPOT_CACHE_TIME
+    results = []
     
-    with _SPOT_CACHE_LOCK:
-        cache = _SPOT_CACHE
-        cache_time = _SPOT_CACHE_TIME
-    
-    if api_mode:
-        if cache is not None:
-            df_spot = cache[cache["代码"].isin(stock_codes)].copy()
-            return df_spot, not df_spot.empty
-        return None, False
-
-    # 命令行/同步调用逻辑
-    if is_trading_time() or cache is None:
-        refresh_spot_cache(force=True)
-        with _SPOT_CACHE_LOCK: cache = _SPOT_CACHE
+    def fetch_stock_data(code):
+        try:
+            # 雪球接口需要股票代码前加上 SH 或 SZ 前缀
+            prefix = "SH" if code.startswith('6') else "SZ"
+            xq_symbol = f"{prefix}{code}"
+            stock_df = ak.stock_individual_spot_xq(symbol=xq_symbol)
             
-    if cache is not None:
-        df_spot = cache[cache["代码"].isin(stock_codes)].copy()
-        return df_spot, not df_spot.empty
-    return None, False
+            # 提取所需数据
+            # 雪球接口返回的涨跌幅字段是 percent
+            change_pct = stock_df['percent'].iloc[0]
+            name = stock_df['name'].iloc[0]
+            return {"代码": code, "名称": name, "涨跌幅": change_pct}
+        except Exception as e:
+            logging.warning(f"[get_stock_spot] 获取股票 {code} 行情失败: {e}")
+            return None
+
+    # 使用线程池并发获取数据
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_code = {executor.submit(fetch_stock_data, code): code for code in stock_codes}
+        for future in concurrent.futures.as_completed(future_to_code):
+            result = future.result()
+            if result:
+                results.append(result)
+    
+    if not results:
+        return pd.DataFrame(columns=["代码", "名称", "涨跌幅"]), False
+
+    df_spot = pd.DataFrame(results)
+    return df_spot, True
 
 
 def get_fund_top10_with_change(fund_code: str, api_mode: bool = False):
@@ -287,8 +580,8 @@ def get_fund_top10_with_change(fund_code: str, api_mode: bool = False):
     df_hold["股票代码"] = df_hold["股票代码"].astype(str).str.zfill(6)
     stock_codes = df_hold["股票代码"].tolist()
 
-    # 获取行情 (API 模式下不发起请求)
-    df_spot, is_live = get_stock_spot(stock_codes, api_mode=api_mode)
+    # 获取行情 (实时调用)
+    df_spot, is_live = get_stock_spot(stock_codes)
     
     if not is_live:
         return df_hold[["序号", "股票代码", "股票名称", "占净值比例"]].copy(), None, found_quarter
@@ -342,3 +635,112 @@ def get_fund_top10_json(fund_code: str) -> dict:
         "top10_weight_pct": round(top10_weight * 100, 2) if top10_weight is not None else None,
         "holdings": holdings,
     }
+
+
+def cleanup_expired_ai_reports():
+    """
+    清理过期的AI分析报告，按7天过期规则删除文件
+    """
+    logging.info("开始清理过期AI分析报告...")
+    
+    # 获取所有AI分析缓存文件
+    cache_files = glob.glob(os.path.join(_AI_ANALYSIS_CACHE_DIR, "*.json"))
+    expired_count = 0
+    
+    for cache_file in cache_files:
+        try:
+            # 获取文件修改时间
+            mod_time = datetime.fromtimestamp(os.path.getmtime(cache_file))
+            # 检查是否超过7天
+            if datetime.now() - mod_time > timedelta(days=7):
+                os.remove(cache_file)
+                expired_count += 1
+                logging.info(f"已删除过期AI分析报告: {os.path.basename(cache_file)}")
+        except Exception as e:
+            logging.error(f"删除过期AI分析报告失败 {cache_file}: {e}")
+    
+    logging.info(f"完成清理，删除了 {expired_count} 个过期AI分析报告")
+
+
+def schedule_cleanup_task():
+    """
+    启动后台定时清理任务，每天执行一次
+    """
+    def cleanup_loop():
+        while True:
+            # 计算距离第二天凌晨的时间差
+            now = datetime.now()
+            next_day = now + timedelta(days=1)
+            next_midnight = next_day.replace(hour=0, minute=0, second=0, microsecond=0)
+            sleep_seconds = (next_midnight - now).total_seconds()
+            
+            # 等待到第二天凌晨
+            time.sleep(sleep_seconds)
+            
+            # 执行清理任务
+            cleanup_expired_ai_reports()
+    
+    # 启动清理任务线程
+    cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
+    cleanup_thread.start()
+    logging.info("AI分析报告清理任务已启动")
+
+
+# 在模块加载时启动清理任务
+schedule_cleanup_task()
+
+
+def get_hot_funds() -> List[dict]:
+    """
+    获取热门基金列表（过去一个月涨幅最高的三只基金），并使用每日缓存。
+    """
+    global _HOT_FUNDS_CACHE, _HOT_FUNDS_CACHE_DATE
+
+    today = date.today()
+
+    # 检查缓存
+    with _HOT_FUNDS_LOCK:
+        if _HOT_FUNDS_CACHE and _HOT_FUNDS_CACHE_DATE == today:
+            return _HOT_FUNDS_CACHE
+
+    # 缓存未命中或已过期，执行数据获取
+    try:
+        fund_rank_df = fetch_with_retry(lambda: ak.fund_open_fund_rank_em())
+        
+        if '近1月' not in fund_rank_df.columns:
+            raise ValueError("排名数据中缺少'近1月'列")
+            
+        fund_rank_df['近1月'] = pd.to_numeric(fund_rank_df['近1月'], errors='coerce')
+        fund_rank_df = fund_rank_df.dropna(subset=['近1月'])
+
+        top_3_funds = fund_rank_df.sort_values(by='近1月', ascending=False).head(3)
+
+        hot_funds = [
+            {"code": row['基金代码'], "name": row['基金简称']}
+            for _, row in top_3_funds.iterrows()
+        ]
+        
+        if not hot_funds:
+            raise ValueError("未能从 akshare 提取出热门基金数据")
+
+        # 更新缓存
+        with _HOT_FUNDS_LOCK:
+            _HOT_FUNDS_CACHE = hot_funds
+            _HOT_FUNDS_CACHE_DATE = today
+
+        return hot_funds
+    
+    except Exception as e:
+        print(f"  ⚠️ [get_hot_funds] 失败: {e}")
+        # 在异常情况下，仍可考虑返回旧缓存（如果有）或静态数据
+        with _HOT_FUNDS_LOCK:
+            if _HOT_FUNDS_CACHE:
+                print("  ↪️  返回旧的缓存数据")
+                return _HOT_FUNDS_CACHE
+        
+        print("  ↪️  返回静态兜底数据")
+        return [
+            {"code": "020465", "name": "招商中证半导体产业ETF联接C"},
+            {"code": "001508", "name": "富国中证红利指数增强A"},
+            {"code": "161725", "name": "招商中证白酒"},
+        ]

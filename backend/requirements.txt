@@ -2,3 +2,4 @@ akshare>=1.12
 pandas>=2.0
 fastapi>=0.100
 uvicorn[standard]>=0.22
+urllib3<2.0

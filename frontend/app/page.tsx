@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
+import ReactMarkdown from "react-markdown";
 import { 
   Search, Star, ArrowUpRight, ArrowDownRight, 
   Info, ExternalLink, X, ShieldCheck, Clock
@@ -30,16 +31,6 @@ type ApiResult = {
 type SearchResult = {
   code: string;
   name: string;
-};
-
-type Sentiment = {
-  status: string;
-  up: number;
-  down: number;
-  flat: number;
-  total: number;
-  time: string;
-  trading: boolean;
 };
 
 // --- Styles ---
@@ -251,6 +242,30 @@ const styles = {
   }
 };
 
+// --- Bubble Component ---
+const Bubble = ({ message, visible }: { message: string, visible: boolean }) => {
+  if (!visible) return null;
+
+  const style = {
+    position: "fixed" as const,
+    top: "3rem",
+    left: "50%",
+    transform: "translateX(-50%)",
+    padding: "0.75rem 1.25rem",
+    background: "linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%)",
+    color: "#fff",
+    borderRadius: "2rem",
+    zIndex: 100,
+    boxShadow: "0 4px 15px rgba(0, 0, 0, 0.2)",
+    fontSize: "0.9rem",
+    fontWeight: 600,
+    animation: "fadeInOut 3s ease-in-out forwards",
+  };
+
+  return <div style={style}>{message}</div>;
+};
+
+
 // --- Components ---
 
 export default function Home() {
@@ -258,18 +273,20 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [data, setData] = useState<ApiResult | null>(null);
-  const [sentiment, setSentiment] = useState<Sentiment | null>(null);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [showSearch, setShowSearch] = useState(false);
   const [watchlist, setWatchlist] = useState<SearchResult[]>([]);
   const [isWatchlistExpanded, setIsWatchlistExpanded] = useState(false);
   const [mounted, setMounted] = useState(false);
+  const [bubble, setBubble] = useState<{ message: string; visible: boolean }>({ message: "", visible: false });
+  const bubbleTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   
   // V2 AI States
   const [aiLoading, setAiLoading] = useState(false);
   const [aiData, setAiData] = useState<any>(null);
   const [aiText, setAiText] = useState("");
-  const [showAi, setShowAi] = useState(false);
+  const [activeAiFundCode, setActiveAiFundCode] = useState<string | null>(null); // Track which fund's AI is active
+  const aiTypingTimerRef = useRef<NodeJS.Timeout | null>(null); // Timer for typing effect
   const [hotFunds, setHotFunds] = useState<SearchResult[]>([]);
   const searchRef = useRef<HTMLDivElement>(null);
   const watchlistRef = useRef<HTMLDivElement>(null);
@@ -277,20 +294,15 @@ export default function Home() {
 
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
-  const fetchSentiment = useCallback(async () => {
-    try {
-      const url = `${API_BASE}/api/sentiment`;
-      const res = await fetch(url);
-      const json = await res.json();
-      setSentiment(json);
-      
-      // If still loading or status is ok, keep polling
-      const nextDelay = json.status === "loading" ? 3000 : 30000;
-      setTimeout(fetchSentiment, nextDelay);
-    } catch (e) {
-      setTimeout(fetchSentiment, 5000);
+  const showBubble = (message: string) => {
+    if (bubbleTimeoutRef.current) {
+      clearTimeout(bubbleTimeoutRef.current);
     }
-  }, [API_BASE]);
+    setBubble({ message, visible: true });
+    bubbleTimeoutRef.current = setTimeout(() => {
+      setBubble({ message: "", visible: false });
+    }, 3000);
+  };
 
   // Initial load
   useEffect(() => {
@@ -299,8 +311,6 @@ export default function Home() {
     if (saved) {
       try { setWatchlist(JSON.parse(saved)); } catch (e) {}
     }
-    // We only call this once, it will recurse via setTimeout
-    fetchSentiment();
     fetchHotFunds();
 
     const handleClickOutside = (event: MouseEvent) => {
@@ -336,41 +346,59 @@ export default function Home() {
   };
 
   const fetchAiAnalysis = async (fundCode: string) => {
-    if (showAi && aiData?.fund_code === fundCode) {
-      setShowAi(false);
+    // Clear any ongoing typing animation
+    if (aiTypingTimerRef.current) {
+      clearInterval(aiTypingTimerRef.current);
+    }
+
+    // If clicking the same fund's button again, just close the panel
+    if (activeAiFundCode === fundCode) {
+      setActiveAiFundCode(null);
       return;
     }
-    
+
     setAiLoading(true);
+    setAiData(null);
     setAiText("");
-    setShowAi(true);
-    
+    setActiveAiFundCode(fundCode); // Set the new fund as active
+
+    console.log(`[AI] 正在向后端请求 ${fundCode} 的AI分析...`); // <<< 增加日志
+
     try {
       const res = await fetch(`${API_BASE}/api/ai-analysis/${fundCode}`);
-      if (!res.ok) throw new Error("No AI data");
       const json = await res.json();
-      setAiData(json);
+
+      console.log("[AI] 从后端收到的原始数据:", json); // <<< 增加日志
+
+      if (!res.ok) {
+        // Throw an error with the message from the backend
+        throw new Error(json.detail || "AI 分析报告加载失败");
+      }
       
-      // Simulate Typing Effect (Chunk-based)
+      setAiData(json);
+
+      // Typing Effect Logic
       let fullText = "";
       json.analysis.forEach((section: any) => {
         fullText += `### ${section.title}\n${section.content}\n\n`;
       });
-      
+
       let currentIdx = 0;
-      const step = 8; // Typing speed (chars per tick)
-      const timer = setInterval(() => {
+      const step = 8;
+      aiTypingTimerRef.current = setInterval(() => {
         if (currentIdx >= fullText.length) {
-          clearInterval(timer);
+          if (aiTypingTimerRef.current) clearInterval(aiTypingTimerRef.current);
           return;
         }
         setAiText(fullText.substring(0, currentIdx + step));
         currentIdx += step;
       }, 30);
-      
-    } catch (e) {
+
+    } catch (e: any) {
+      console.error("[AI] 获取分析时捕获到错误:", e); // <<< 增加日志
+      // Display the actual error from the backend
+      setAiText(`⚠️ ${e.message}`);
       setAiData(null);
-      setAiText("⚠️ 该基金暂无预生成的 AI 深度分析报告。我们正在加紧覆盖更多热门基金...");
     } finally {
       setAiLoading(false);
     }
@@ -418,38 +446,9 @@ export default function Home() {
 
   if (!mounted) return null;
 
-  const totalSentiment = (sentiment?.up || 0) + (sentiment?.down || 0);
-  const upRatio = totalSentiment > 0 ? ((sentiment?.up || 0) / totalSentiment) * 100 : 50;
-
-  const getSmartTimeLabel = () => {
-    if (!sentiment || !sentiment.time) return "";
-    const [datePart, timePart] = sentiment.time.split(" ");
-    const today = new Date().toISOString().split("T")[0];
-    const isToday = datePart === today;
-    const timeHM = timePart.substring(0, 5);
-
-    if (sentiment.status === "loading") return "加载中";
-
-    if (sentiment.trading) {
-      return timeHM;
-    } else {
-      if (isToday) {
-        const hour = parseInt(timePart.split(":")[0]);
-        const minute = parseInt(timePart.split(":")[1]);
-        const totalMinutes = hour * 60 + minute;
-
-        if (totalMinutes < 570) return "昨日收盘"; 
-        if (totalMinutes >= 900) return "已收盘";
-        return "午间休市";
-      } else {
-        const [y, m, d] = datePart.split("-");
-        return `${m}-${d} 收盘`;
-      }
-    }
-  };
-
   return (
     <main style={styles.container}>
+      <Bubble message={bubble.message} visible={bubble.visible} />
       {/* Header */}
       <header style={styles.header}>
         <h1 style={styles.title}>
@@ -458,10 +457,10 @@ export default function Home() {
         </h1>
 
         <nav style={{ display: "flex", alignItems: "center", gap: "0.8rem" }}>
-          <a href="#" style={styles.navLink} onClick={(e) => { e.preventDefault(); alert("敬请期待：基金基础知识扫盲计划"); }}>
+          <a href="#" style={styles.navLink} onClick={(e) => { e.preventDefault(); showBubble("敬请期待：基金基础知识扫盲计划"); }}>
             基金入门
           </a>
-          <a href="#" style={styles.navLink} onClick={(e) => { e.preventDefault(); alert("市场观点功能正在开发中，敬请期待！"); }}>
+          <a href="#" style={styles.navLink} onClick={(e) => { e.preventDefault(); showBubble("市场观点功能正在开发中，敬请期待！"); }}>
             市场观点
           </a>
         </nav>
@@ -640,14 +639,29 @@ export default function Home() {
           </div>
 
           {/* AI Analysis Panel */}
-          {showAi && (
+          {activeAiFundCode === data.fund_code && (
             <div style={styles.aiPanel}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", color: "#a78bfa", fontWeight: 800 }}>
                   <ShieldCheck size={20} /> AI 深度解读分析报告
                 </div>
-                <div style={{ fontSize: "0.75rem", color: "#71717a" }}>
-                  {aiData?.update_date ? `更新于 ${aiData.update_date}` : "离线预生成"}
+                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                  <div style={{ fontSize: "0.75rem", color: "#71717a" }}>
+                    {aiData?.update_date ? `更新于 ${aiData.update_date}` : ""}
+                  </div>
+                  {aiData?.source && (
+                    <span style={{ 
+                      fontSize: "0.7rem", 
+                      color: "#a78bfa",
+                      background: "rgba(139, 92, 246, 0.15)",
+                      border: "1px solid rgba(139, 92, 246, 0.3)",
+                      padding: "0.15rem 0.5rem",
+                      borderRadius: "0.5rem",
+                      whiteSpace: "nowrap"
+                    }}>
+                      {aiData.source}
+                    </span>
+                  )}
                 </div>
               </div>
               
@@ -656,19 +670,21 @@ export default function Home() {
                   正在连接云端大脑，调取深度分析报告...
                 </div>
               ) : (
-                <div style={{ ...styles.aiContent, whiteSpace: "pre-wrap" }}>
-                  {aiText.split("### ").map((section, idx) => {
-                    if (!section) return null;
-                    const lines = section.split("\n");
-                    const title = lines[0];
-                    const content = lines.slice(1).join("\n");
-                    return (
-                      <div key={idx} style={styles.aiSection}>
-                        <div style={styles.aiTitle}>{title}</div>
-                        <div style={styles.aiContent}>{content}</div>
-                      </div>
-                    );
-                  })}
+                <div style={{ ...styles.aiContent }}>
+                  <ReactMarkdown
+                    components={{
+                      h3: ({children}) => <div style={{...styles.aiTitle, marginTop: '1.2rem', fontSize: '1.05rem', borderLeft: '4px solid #8b5cf6', paddingLeft: '0.5rem'}}>{children}</div>,
+                      h4: ({children}) => <div style={{...styles.aiTitle, marginTop: '1rem', fontSize: '0.95rem', color: '#c4b5fd'}}>{children}</div>,
+                      p: ({children}) => <div style={{marginBottom: '0.8rem', lineHeight: 1.7}}>{children}</div>,
+                      ul: ({children}) => <ul style={{paddingLeft: '1.2rem', margin: '0.5rem 0', listStyleType: 'disc', color: '#8b5cf6'}}>{children}</ul>,
+                      li: ({children}) => <li style={{marginBottom: '0.3rem', color: '#d4d4d8'}}><span style={{color: '#d4d4d8'}}>{children}</span></li>,
+                      strong: ({children}) => <strong style={{color: '#fff', fontWeight: 700}}>{children}</strong>,
+                      hr: () => <hr style={{borderColor: '#27272a', margin: '1.5rem 0', borderTopWidth: '1px'}} />,
+                      blockquote: ({children}) => <blockquote style={{borderLeft: '4px solid #3f3f46', paddingLeft: '1rem', color: '#a1a1aa', fontStyle: 'italic', margin: '1rem 0'}}>{children}</blockquote>
+                    }}
+                  >
+                    {aiText}
+                  </ReactMarkdown>
                 </div>
               )}
             </div>
@@ -740,6 +756,12 @@ export default function Home() {
       <style dangerouslySetInnerHTML={{ __html: `
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeInOut {
+          0% { opacity: 0; transform: translate(-50%, -20px); }
+          15% { opacity: 1; transform: translate(-50%, 0); }
+          85% { opacity: 1; transform: translate(-50%, 0); }
+          100% { opacity: 0; transform: translate(-50%, -20px); }
+        }
         @keyframes pulse {
           0% { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.4); transform: scale(1); }
           70% { box-shadow: 0 0 0 10px rgba(139, 92, 246, 0); transform: scale(1.02); }
