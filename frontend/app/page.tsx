@@ -3,8 +3,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import { 
-  Search, Star, ArrowUpRight, ArrowDownRight, 
-  Info, ExternalLink, X, ShieldCheck, Clock
+  Search, Star, 
+  Info, ExternalLink, X, ShieldCheck
 } from "lucide-react";
 
 // --- Types ---
@@ -239,6 +239,33 @@ const styles = {
     fontSize: "0.8rem",
     color: "#71717a",
     lineHeight: 1.6,
+  },
+  mvpBanner: {
+    background: "rgba(139, 92, 246, 0.08)",
+    border: "1px solid rgba(139, 92, 246, 0.25)",
+    borderRadius: "0.875rem",
+    padding: "0.85rem 1rem",
+    margin: "0.75rem 0 0.9rem",
+    color: "#d4d4d8",
+  },
+  mvpBannerTitle: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.5rem",
+    fontWeight: 900,
+    color: "#c4b5fd",
+    marginBottom: "0.35rem",
+    letterSpacing: "-0.01em",
+  },
+  mvpBannerText: {
+    fontSize: "0.85rem",
+    color: "#a1a1aa",
+    lineHeight: 1.7,
+  },
+  mvpBannerLink: {
+    color: "#a78bfa",
+    textDecoration: "none",
+    fontWeight: 800,
   }
 };
 
@@ -293,6 +320,7 @@ export default function Home() {
   const [hasWatchlistOverflow, setHasWatchlistOverflow] = useState(false);
 
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+  const SALES_EMAIL = process.env.NEXT_PUBLIC_SALES_EMAIL || "sean.zhang.fintech.edu@gmail.com";
 
   const showBubble = (message: string) => {
     if (bubbleTimeoutRef.current) {
@@ -736,6 +764,26 @@ export default function Home() {
 
       {/* Compliance Disclaimer */}
       <footer style={styles.footer}>
+        <div style={styles.mvpBanner}>
+          <div style={styles.mvpBannerTitle}>
+            <Info size={18} /> 重要提示
+          </div>
+          <div style={styles.mvpBannerText}>
+            当前版本为 MVP，可能存在速度较慢或者输出不稳定等情况。
+            如需更专业、更快、更稳定的服务，请联系销售团队获取支持
+            {SALES_EMAIL ? (
+              <>
+                ：{" "}
+                <a style={styles.mvpBannerLink} href={`mailto:${SALES_EMAIL}`}>
+                  {SALES_EMAIL}。
+                </a>
+              </>
+            ) : (
+              "。"
+            )}
+          </div>
+        </div>
+
         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "1rem", color: "#a1a1aa" }}>
           <Info size={18} />
           <strong style={{ fontSize: "0.95rem", letterSpacing: "0.02em" }}>合规提示与风险声明</strong>

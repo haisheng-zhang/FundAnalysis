@@ -25,6 +25,13 @@
 - `LLM_AI_API_KEY` = 你的 OpenRouter 密钥
 - `LLM_API_URL` = `https://openrouter.ai/api/v1/chat/completions`
 - `LLM_MODEL_NAME` = `deepseek/deepseek-r1`
+- `顶流模型：OpenAI，Claude，DeepSeek等价格不一，都有好有差，根据自己的需求选择`
+- `Google 的模型相对便宜，返回质量和速度以及限流需要测试`
+- `MVP阶段我们从免费model开始，根据用户量选择是否升级到付费model`
+- `比较好的免费model(没有限流，返回效果不错），试过了不错的： `
+- `stepfun/step-3.5-flash:free：长，专业，偶尔会有问题，不返回结果，但是问题不大`
+- `arcee-ai/trinity-large-preview:free，短，还行`
+
 
 ### 第三步：前端部署（Vercel）
 1. 导入项目：打开 [Vercel](https://vercel.com/)，选择 **Import Git Repository**。
@@ -32,6 +39,7 @@
 3. 设置根目录：如果前端代码在 `frontend` 目录，配置 **Root Directory** (根目录) 为 `frontend`。
 4. 环境变量：
    - `NEXT_PUBLIC_API_URL` = `https://你的后端域名.onrender.com`（末尾不带 `/`）
+   - `NEXT_PUBLIC_SALES_EMAIL` = `sean.zhang.fintech.edu@gmail.com`
 5. 部署：点击 **Deploy**。
 
 ### 第四步：自定义域名（Namecheap）

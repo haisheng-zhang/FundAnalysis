@@ -126,7 +126,6 @@ def get_ai_analysis(fund_code: str, client_ip: str = "default"):
     """
     获取AI分析报告，支持缓存和IP限制
     """
-    logging.info(f"[get_ai_analysis] fund_code={fund_code} ip={client_ip}")
     # 检查IP请求次数限制
     with _IP_REQUEST_LOCK:
         if client_ip in _IP_REQUEST_COUNT:
@@ -153,23 +152,12 @@ def get_ai_analysis(fund_code: str, client_ip: str = "default"):
             with open(cache_path, 'r', encoding='utf-8') as f:
                 try:
                     cached_data = json.load(f)
-                    # 标记来源为缓存，便于前端与调试识别
-                    try:
-                        cached_data["source"] = "AI深度分析"
-                    except Exception:
-                        pass
-                    logging.info(f"[get_ai_analysis] using cache for {fund_code}")
                     return cached_data
                 except json.JSONDecodeError:
                     pass  # 继续执行，重新生成分析
 
     # 如果没有有效缓存，则生成新的AI分析
     analysis = generate_realtime_ai_analysis(fund_code)
-    try:
-        analysis["source"] = "AI深度分析"
-    except Exception:
-        pass
-    logging.info(f"[get_ai_analysis] generated analysis for {fund_code}")
     
     # 保存到缓存
     with open(cache_path, 'w', encoding='utf-8') as f:
@@ -204,7 +192,7 @@ def call_llm_api(context: str) -> Optional[dict]:
         # 获取API配置
         llm_api_key = os.getenv('LLM_AI_API_KEY')
         llm_api_url = os.getenv('LLM_API_URL', 'https://openrouter.ai/api/v1/chat/completions')
-        llm_model = os.getenv('LLM_MODEL_NAME', 'deepseek/deepseek-r1')
+        llm_model = os.getenv('LLM_MODEL_NAME', 'stepfun/step-3.5-flash:free')
         
         logging.info(f"读取到 LLM API 密钥: {'存在' if llm_api_key else '不存在'}")
         if not llm_api_key:
@@ -219,6 +207,10 @@ def call_llm_api(context: str) -> Optional[dict]:
         payload = {
             "model": llm_model,
             "messages": [
+                {
+                    "role": "system", 
+                    "content": "你是一位资深的基金分析师，请根据以下信息，对这只基金进行专业、客观的分析。"
+                },
                 {
                     "role": "user",
                     "content": AI_ANALYSIS_PROMPT_TEMPLATE.format(context=context)
@@ -511,6 +503,63 @@ def get_stock_spot(stock_codes: List[str]) -> Tuple[Optional[pd.DataFrame], bool
 
     results = []
     
+    def _to_float(value) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        s = str(value).strip()
+        if not s or s in {"--", "None", "nan"}:
+            return None
+        s = s.replace("%", "").strip()
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    def _extract_xq_change_and_name(stock_df: pd.DataFrame) -> Tuple[Optional[str], Optional[float]]:
+        if stock_df is None or stock_df.empty:
+            return None, None
+
+        cols = set(map(str, stock_df.columns))
+        if {"item", "value"}.issubset(cols):
+            items = stock_df["item"].astype(str).tolist()
+            values = stock_df["value"].tolist()
+            data = dict(zip(items, values))
+
+            name = data.get("名称") or data.get("name")
+            change = (
+                data.get("涨幅")
+                or data.get("涨跌幅")
+                or data.get("涨跌幅(%)")
+                or data.get("percent")
+                or data.get("pct_chg")
+            )
+            return (str(name) if name is not None else None), _to_float(change)
+
+        name = None
+        if "name" in cols:
+            try:
+                name = stock_df["name"].iloc[0]
+            except Exception:
+                name = None
+        elif "名称" in cols:
+            try:
+                name = stock_df["名称"].iloc[0]
+            except Exception:
+                name = None
+
+        change_pct = None
+        for key in ["percent", "pct_chg", "涨幅", "涨跌幅", "涨跌幅(%)"]:
+            if key in cols:
+                try:
+                    change_pct = _to_float(stock_df[key].iloc[0])
+                    break
+                except Exception:
+                    continue
+
+        return (str(name) if name is not None else None), change_pct
+
     def fetch_stock_data(code):
         try:
             # 雪球接口需要股票代码前加上 SH 或 SZ 前缀
@@ -518,10 +567,9 @@ def get_stock_spot(stock_codes: List[str]) -> Tuple[Optional[pd.DataFrame], bool
             xq_symbol = f"{prefix}{code}"
             stock_df = ak.stock_individual_spot_xq(symbol=xq_symbol)
             
-            # 提取所需数据
-            # 雪球接口返回的涨跌幅字段是 percent
-            change_pct = stock_df['percent'].iloc[0]
-            name = stock_df['name'].iloc[0]
+            name, change_pct = _extract_xq_change_and_name(stock_df)
+            if change_pct is None:
+                raise KeyError("change_pct not found")
             return {"代码": code, "名称": name, "涨跌幅": change_pct}
         except Exception as e:
             logging.warning(f"[get_stock_spot] 获取股票 {code} 行情失败: {e}")
