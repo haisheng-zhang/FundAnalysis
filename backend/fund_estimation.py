@@ -580,15 +580,11 @@ def get_stock_spot(stock_codes: List[str]) -> Tuple[Optional[pd.DataFrame], bool
             # 雪球接口需要股票代码前加上 SH 或 SZ 前缀
             prefix = "SH" if code.startswith('6') else "SZ"
             xq_symbol = f"{prefix}{code}"
-
-            logging.info(f"[get_stock_spot] 获取股票 {code} 行情")
             stock_df = ak.stock_individual_spot_xq(symbol=xq_symbol)
-            
             name, change_pct = _extract_xq_change_and_name(stock_df)
             if change_pct is None:
                 raise KeyError("change_pct not found")
 
-            logging.info(f"[get_stock_spot] 获取股票 {code} 行情成功, 名称: {name}, 涨跌幅: {change_pct}")
             return {"代码": code, "名称": name, "涨跌幅": change_pct}
         except Exception as e:
             logging.warning(f"[get_stock_spot] 获取股票 {code} 行情失败: {e}")
