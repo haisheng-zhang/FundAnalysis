@@ -11,9 +11,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-BUILD_ID = "api-2026-03-09-reqlog-1"
-print(f"[BOOT] {BUILD_ID} loaded file={__file__}")
-
 from fund_estimation import (
     get_fund_top10_json, 
     search_funds, 
@@ -48,12 +45,20 @@ app.add_middleware(
 
 
 @app.get("/api/fund/{fund_code}")
-def api_fund(fund_code: str):
-    """根据基金代码返回十大重仓 + 估算涨幅（行情来自内存缓存，由后台每 10 秒刷新）。"""
+def api_fund(request: Request, fund_code: str):
+    """根据基金代码返回十大重仓 + 估算涨幅。"""
+    client_ip = request.client.host if request.client else "unknown"
+    logging.warning(f"[api_fund] start fund_code={fund_code} ip={client_ip}")
+
     if not fund_code.isdigit() or len(fund_code) > 6:
         raise HTTPException(status_code=400, detail="基金代码应为数字，最多6位")
+
     try:
-        return get_fund_top10_json(fund_code.strip())
+        result = get_fund_top10_json(fund_code.strip())
+        logging.warning(
+            f"[api_fund] done fund_code={fund_code} ip={client_ip} estimated_change={result.get('estimated_change')} holdings={len(result.get('holdings', []))}"
+        )
+        return result
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

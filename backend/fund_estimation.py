@@ -4,6 +4,7 @@ import re
 import time
 import threading
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 import os
 import json
 from typing import Optional, Tuple, List
@@ -49,9 +50,16 @@ logging.basicConfig(
 # 辅助函数：交易时间判断与重试机制
 # --------------------------------------------------------------------------------
 
+def _now_cn() -> datetime:
+    try:
+        return datetime.now(ZoneInfo("Asia/Shanghai"))
+    except Exception:
+        return datetime.now()
+
+
 def is_trading_time():
     """判断当前是否在 A 股交易时间内 (周一至周五 9:30-11:30, 13:00-15:00)"""
-    now = datetime.now()
+    now = _now_cn()
     if now.weekday() >= 5:
         return False
     t = now.time()
@@ -62,7 +70,7 @@ def is_trading_time():
 
 def get_trading_time_reason():
     """返回非交易时间的友好描述，用于日志输出"""
-    now = datetime.now()
+    now = _now_cn()
     if now.weekday() >= 5:
         return f"今天是{'周六' if now.weekday() == 5 else '周日'}，非交易日"
     elif now.time() < datetime.strptime("09:30", "%H:%M").time():
@@ -497,9 +505,16 @@ def get_stock_spot(stock_codes: List[str]) -> Tuple[Optional[pd.DataFrame], bool
     使用雪球 API，并发获取指定股票列表的实时行情。
     返回一个包含实时涨跌幅的 DataFrame。
     """
-    if not is_trading_time():
-        # 非交易时间，返回空 DataFrame，避免不必要的 API 调用
-        return pd.DataFrame(columns=["代码", "名称", "涨跌幅"]), False
+    now = _now_cn()
+    tz = getattr(now.tzinfo, "key", str(now.tzinfo))
+    logging.warning(
+        f"[get_stock_spot] start codes={len(stock_codes)} sample={stock_codes[:3]} now={now.isoformat()} tz={tz} trading={is_trading_time()} reason={get_trading_time_reason()}"
+    )
+
+    # TODO: TEST ONLY
+    # if not is_trading_time():
+    #     # 非交易时间，返回空 DataFrame，避免不必要的 API 调用
+    #     return pd.DataFrame(columns=["代码", "名称", "涨跌幅"]), False
 
     results = []
     
@@ -565,11 +580,15 @@ def get_stock_spot(stock_codes: List[str]) -> Tuple[Optional[pd.DataFrame], bool
             # 雪球接口需要股票代码前加上 SH 或 SZ 前缀
             prefix = "SH" if code.startswith('6') else "SZ"
             xq_symbol = f"{prefix}{code}"
+
+            logging.info(f"[get_stock_spot] 获取股票 {code} 行情")
             stock_df = ak.stock_individual_spot_xq(symbol=xq_symbol)
             
             name, change_pct = _extract_xq_change_and_name(stock_df)
             if change_pct is None:
                 raise KeyError("change_pct not found")
+
+            logging.info(f"[get_stock_spot] 获取股票 {code} 行情成功, 名称: {name}, 涨跌幅: {change_pct}")
             return {"代码": code, "名称": name, "涨跌幅": change_pct}
         except Exception as e:
             logging.warning(f"[get_stock_spot] 获取股票 {code} 行情失败: {e}")
@@ -584,8 +603,10 @@ def get_stock_spot(stock_codes: List[str]) -> Tuple[Optional[pd.DataFrame], bool
                 results.append(result)
     
     if not results:
+        logging.warning(f"[get_stock_spot] done ok=0 total={len(stock_codes)}")
         return pd.DataFrame(columns=["代码", "名称", "涨跌幅"]), False
 
+    logging.warning(f"[get_stock_spot] done ok={len(results)} total={len(stock_codes)}")
     df_spot = pd.DataFrame(results)
     return df_spot, True
 
@@ -629,9 +650,11 @@ def get_fund_top10_with_change(fund_code: str, api_mode: bool = False):
     stock_codes = df_hold["股票代码"].tolist()
 
     # 获取行情 (实时调用)
+    logging.warning(f"[get_fund_top10_with_change] fetch spot fund_code={fund_code} stocks={len(stock_codes)} quarter={found_quarter}")
     df_spot, is_live = get_stock_spot(stock_codes)
-    
+
     if not is_live:
+        logging.warning(f"[get_fund_top10_with_change] spot not live fund_code={fund_code} reason={get_trading_time_reason()}")
         return df_hold[["序号", "股票代码", "股票名称", "占净值比例"]].copy(), None, found_quarter
 
     # 数据合并与估算计算
@@ -678,7 +701,7 @@ def get_fund_top10_json(fund_code: str) -> dict:
         "fund_code": fund_code,
         "fund_name": fund_name,
         "quarter": found_quarter,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "time": _now_cn().strftime("%Y-%m-%d %H:%M:%S"),
         "estimated_change": float(estimated_change) if estimated_change is not None else None,
         "top10_weight_pct": round(top10_weight * 100, 2) if top10_weight is not None else None,
         "holdings": holdings,
