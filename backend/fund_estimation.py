@@ -662,9 +662,15 @@ def get_fund_top10_with_change(fund_code: str, api_mode: bool = False):
     df_result["权重"] = pd.to_numeric(df_result["占净值比例"].astype(str).str.replace("%", "").str.strip(), errors="coerce") / 100
     df_result["贡献涨跌幅(%)"] = (df_result["实时涨跌幅(%)"] * df_result["权重"]).round(4)
 
-    estimated_change = df_result["贡献涨跌幅(%)"].sum()
-    return df_result, estimated_change, found_quarter
+    top10_weight = float(df_result["权重"].sum()) if "权重" in df_result.columns else 0.0
+    top10_contribution = float(df_result["贡献涨跌幅(%)"].sum())
 
+    if top10_weight > 0:
+        estimated_change = top10_contribution / top10_weight
+    else:
+        estimated_change = None
+
+    return df_result, estimated_change, found_quarter
 
 def get_fund_top10_json(fund_code: str) -> dict:
     """包装业务逻辑，返回前端友好的 JSON 结构。"""
