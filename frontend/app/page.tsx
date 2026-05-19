@@ -1,10 +1,10 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import ReactMarkdown from "react-markdown";
-import { 
-  Search, Star, 
-  Info, ExternalLink, X, ShieldCheck
+// import ReactMarkdown from "react-markdown"; // AI feature paused
+import {
+  Search, Star,
+  Info, ExternalLink, X, ShieldCheck, ChevronDown, ChevronUp
 } from "lucide-react";
 
 // --- Types ---
@@ -233,16 +233,15 @@ const styles = {
     flexShrink: 0,
   },
   footer: {
-    marginTop: "2.5rem", // Reduced margin
-    paddingTop: "1.5rem",
-    borderTop: "1px solid #1a1a20",
+    marginTop: "1.25rem",
+    paddingTop: "0.75rem",
     fontSize: "0.8rem",
     color: "#71717a",
     lineHeight: 1.6,
   },
   mvpBanner: {
-    background: "rgba(139, 92, 246, 0.08)",
-    border: "1px solid rgba(139, 92, 246, 0.25)",
+    background: "rgba(59, 130, 246, 0.06)",
+    border: "1px solid rgba(59, 130, 246, 0.2)",
     borderRadius: "0.875rem",
     padding: "0.85rem 1rem",
     margin: "0.75rem 0 0.9rem",
@@ -252,8 +251,8 @@ const styles = {
     display: "flex",
     alignItems: "center",
     gap: "0.5rem",
-    fontWeight: 900,
-    color: "#c4b5fd",
+    fontWeight: 700,
+    color: "#93c5fd",
     marginBottom: "0.35rem",
     letterSpacing: "-0.01em",
   },
@@ -263,9 +262,9 @@ const styles = {
     lineHeight: 1.7,
   },
   mvpBannerLink: {
-    color: "#a78bfa",
+    color: "#3b82f6",
     textDecoration: "none",
-    fontWeight: 800,
+    fontWeight: 600,
   }
 };
 
@@ -307,13 +306,17 @@ export default function Home() {
   const [mounted, setMounted] = useState(false);
   const [bubble, setBubble] = useState<{ message: string; visible: boolean }>({ message: "", visible: false });
   const bubbleTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const autoRefreshRef = useRef<NodeJS.Timeout | null>(null);
+  const currentFundRef = useRef<SearchResult | null>(null);
   
-  // V2 AI States
-  const [aiLoading, setAiLoading] = useState(false);
-  const [aiData, setAiData] = useState<any>(null);
-  const [aiText, setAiText] = useState("");
-  const [activeAiFundCode, setActiveAiFundCode] = useState<string | null>(null); // Track which fund's AI is active
-  const aiTypingTimerRef = useRef<NodeJS.Timeout | null>(null); // Timer for typing effect
+  // V2 AI States — paused, teaser mode
+  // const [aiLoading, setAiLoading] = useState(false);
+  // const [aiData, setAiData] = useState<any>(null);
+  // const [aiText, setAiText] = useState("");
+  // const [activeAiFundCode, setActiveAiFundCode] = useState<string | null>(null);
+  // const aiTypingTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [showAiTeaser, setShowAiTeaser] = useState(false);
+  const [showHotPanel, setShowHotPanel] = useState(false);
   const [hotFunds, setHotFunds] = useState<SearchResult[]>([]);
   const searchRef = useRef<HTMLDivElement>(null);
   const watchlistRef = useRef<HTMLDivElement>(null);
@@ -350,6 +353,38 @@ export default function Home() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []); // Only once on mount
 
+  // Trading hours check (CST = UTC+8): 9:30-11:30, 13:00-15:00, weekdays only
+  const isTradingHours = () => {
+    const now = new Date();
+    const cst = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+    const day = cst.getUTCDay();
+    if (day === 0 || day === 6) return false;
+    const t = cst.getUTCHours() * 60 + cst.getUTCMinutes();
+    return (t >= 9 * 60 + 30 && t <= 11 * 60 + 30) || (t >= 13 * 60 && t <= 15 * 60);
+  };
+
+  // Auto-refresh every 60s during trading hours
+  useEffect(() => {
+    const schedule = () => {
+      autoRefreshRef.current = setTimeout(async () => {
+        if (currentFundRef.current && isTradingHours()) {
+          await silentRefresh(currentFundRef.current);
+        }
+        schedule();
+      }, 60000);
+    };
+    schedule();
+    return () => { if (autoRefreshRef.current) clearTimeout(autoRefreshRef.current); };
+  }, []);
+
+  const silentRefresh = async (fund: SearchResult) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/fund/${fund.code}`);
+      const json = await res.json();
+      if (res.ok) setData(json);
+    } catch (e) {}
+  };
+
   // Check watchlist overflow
   useEffect(() => {
     const checkOverflow = () => {
@@ -373,64 +408,8 @@ export default function Home() {
     } catch (e) {}
   };
 
-  const fetchAiAnalysis = async (fundCode: string) => {
-    // Clear any ongoing typing animation
-    if (aiTypingTimerRef.current) {
-      clearInterval(aiTypingTimerRef.current);
-    }
-
-    // If clicking the same fund's button again, just close the panel
-    if (activeAiFundCode === fundCode) {
-      setActiveAiFundCode(null);
-      return;
-    }
-
-    setAiLoading(true);
-    setAiData(null);
-    setAiText("");
-    setActiveAiFundCode(fundCode); // Set the new fund as active
-
-    console.log(`[AI] 正在向后端请求 ${fundCode} 的AI分析...`); // <<< 增加日志
-
-    try {
-      const res = await fetch(`${API_BASE}/api/ai-analysis/${fundCode}`);
-      const json = await res.json();
-
-      console.log("[AI] 从后端收到的原始数据:", json); // <<< 增加日志
-
-      if (!res.ok) {
-        // Throw an error with the message from the backend
-        throw new Error(json.detail || "AI 分析报告加载失败");
-      }
-      
-      setAiData(json);
-
-      // Typing Effect Logic
-      let fullText = "";
-      json.analysis.forEach((section: any) => {
-        fullText += `### ${section.title}\n${section.content}\n\n`;
-      });
-
-      let currentIdx = 0;
-      const step = 8;
-      aiTypingTimerRef.current = setInterval(() => {
-        if (currentIdx >= fullText.length) {
-          if (aiTypingTimerRef.current) clearInterval(aiTypingTimerRef.current);
-          return;
-        }
-        setAiText(fullText.substring(0, currentIdx + step));
-        currentIdx += step;
-      }, 30);
-
-    } catch (e: any) {
-      console.error("[AI] 获取分析时捕获到错误:", e); // <<< 增加日志
-      // Display the actual error from the backend
-      setAiText(`⚠️ ${e.message}`);
-      setAiData(null);
-    } finally {
-      setAiLoading(false);
-    }
-  };
+  // AI analysis paused — teaser mode
+  // const fetchAiAnalysis = async (fundCode: string) => { ... };
 
   const handleSearch = useCallback(async (q: string) => {
     if (q.length < 2) {
@@ -446,6 +425,13 @@ export default function Home() {
   }, [API_BASE]);
 
   const fetchFund = async (fund: SearchResult) => {
+    currentFundRef.current = fund;
+    // Auto-add to recently viewed: move to front, cap at 10
+    setWatchlist(prev => {
+      const updated = [fund, ...prev.filter(f => f.code !== fund.code)].slice(0, 10);
+      localStorage.setItem("fund_watchlist", JSON.stringify(updated));
+      return updated;
+    });
     setLoading(true);
     setError(null);
     setShowSearch(false);
@@ -458,6 +444,7 @@ export default function Home() {
         return;
       }
       setData(json);
+      setShowHotPanel(false);
     } catch (err) {
       setError("网络错误，请稍后再试");
     } finally {
@@ -485,11 +472,12 @@ export default function Home() {
         </h1>
 
         <nav style={{ display: "flex", alignItems: "center", gap: "0.8rem" }}>
-          <a href="#" style={styles.navLink} onClick={(e) => { e.preventDefault(); showBubble("敬请期待：基金基础知识扫盲计划"); }}>
-            基金入门
-          </a>
-          <a href="#" style={styles.navLink} onClick={(e) => { e.preventDefault(); showBubble("市场观点功能正在开发中，敬请期待！"); }}>
-            市场观点
+          <a
+            href="#"
+            style={{ ...styles.navLink, color: showHotPanel ? "#f59e0b" : "#a1a1aa" }}
+            onClick={(e) => { e.preventDefault(); setShowHotPanel(v => !v); }}
+          >
+            热门基金
           </a>
         </nav>
       </header>
@@ -513,18 +501,38 @@ export default function Home() {
           }}
         />
         
-        {showSearch && (searchResults.length > 0 || code === "") && (
+        {showSearch && (searchResults.length > 0 || hotFunds.length > 0) && (
           <div style={{
             position: "absolute", top: "100%", left: 0, right: 0,
             background: "#18181b", border: "1px solid #27272a", borderRadius: "0.75rem",
             marginTop: "0.5rem", zIndex: 10, maxHeight: "320px", overflowY: "auto",
             boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.5)"
           }}>
-            {code === "" && hotFunds.length > 0 && (
+            {searchResults.length > 0 && (
               <>
-                <div style={styles.hotFundLabel}>最近热门基金</div>
+                <div style={styles.hotFundLabel}>搜索结果</div>
+                {searchResults.map((f) => (
+                  <div
+                    key={f.code}
+                    style={{ padding: "0.9rem 1.25rem", borderBottom: "1px solid #27272a", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+                    onClick={() => fetchFund(f)}
+                  >
+                    <div>
+                      <span style={{ fontWeight: 600, color: "#fff", marginRight: "0.6rem" }}>{f.code}</span>
+                      <span style={{ color: "#a1a1aa" }}>{f.name}</span>
+                    </div>
+                    <div onClick={(e) => { e.stopPropagation(); toggleWatchlist(f); }}>
+                      {watchlist.find(w => w.code === f.code) ? <Star size={18} fill="#f59e0b" color="#f59e0b" /> : <Star size={18} color="#3f3f46" />}
+                    </div>
+                  </div>
+                ))}
+              </>
+            )}
+            {hotFunds.length > 0 && (
+              <>
+                <div style={{ ...styles.hotFundLabel, ...(searchResults.length > 0 ? { borderTop: "1px solid #27272a", padding: "0.5rem 1.25rem 0.25rem" } : {}) }}>热门基金</div>
                 {hotFunds.map((f) => (
-                  <div 
+                  <div
                     key={f.code}
                     style={styles.hotFundItem}
                     onClick={() => { fetchFund(f); setShowSearch(false); }}
@@ -535,24 +543,8 @@ export default function Home() {
                     </div>
                   </div>
                 ))}
-                <div style={{ ...styles.hotFundLabel, borderTop: "1px solid #27272a", marginTop: "0.2rem", paddingTop: "0.5rem" }}>搜索结果</div>
               </>
             )}
-            {searchResults.map((f) => (
-              <div 
-                key={f.code}
-                style={{ padding: "0.9rem 1.25rem", borderBottom: "1px solid #27272a", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}
-                onClick={() => fetchFund(f)}
-              >
-                <div>
-                  <span style={{ fontWeight: 600, color: "#fff", marginRight: "0.6rem" }}>{f.code}</span>
-                  <span style={{ color: "#a1a1aa" }}>{f.name}</span>
-                </div>
-                <div onClick={(e) => { e.stopPropagation(); toggleWatchlist(f); }}>
-                  {watchlist.find(w => w.code === f.code) ? <Star size={18} fill="#f59e0b" color="#f59e0b" /> : <Star size={18} color="#3f3f46" />}
-                </div>
-              </div>
-            ))}
           </div>
         )}
       </div>
@@ -574,14 +566,58 @@ export default function Home() {
               </div>
             ))}
           </div>
-          {(hasWatchlistOverflow || isWatchlistExpanded) && (
-            <button 
-              style={styles.watchlistExpandBtn}
-              onClick={() => setIsWatchlistExpanded(!isWatchlistExpanded)}
+          <div style={{ display: "flex", alignItems: "center", gap: "0.2rem", flexShrink: 0 }}>
+            {(hasWatchlistOverflow || isWatchlistExpanded) && (
+              <button
+                style={{ ...styles.watchlistExpandBtn }}
+                onClick={() => setIsWatchlistExpanded(!isWatchlistExpanded)}
+              >
+                {isWatchlistExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+              </button>
+            )}
+            <button
+              style={{ ...styles.watchlistExpandBtn, color: "#ef4444" }}
+              onClick={() => { setWatchlist([]); localStorage.removeItem("fund_watchlist"); setIsWatchlistExpanded(false); }}
             >
-              {isWatchlistExpanded ? "收起" : "..."}
+              <X size={14} />
             </button>
-          )}
+          </div>
+        </div>
+      )}
+
+      {/* Hot funds panel — landing (no fund) or toggled from nav */}
+      {(showHotPanel || !data) && hotFunds.length > 0 && !loading && (
+        <div style={{ ...styles.card, padding: "0.5rem 0", marginBottom: "0.6rem" }}>
+          <div style={{ padding: "0.5rem 1rem 0.25rem", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span style={{ fontSize: "0.75rem", fontWeight: 700, color: "#71717a", textTransform: "uppercase" as const, letterSpacing: "0.05em" }}>
+              热门基金 · 近1月涨幅
+            </span>
+            {data && (
+              <button onClick={() => setShowHotPanel(false)} style={{ background: "none", border: "none", color: "#52525b", cursor: "pointer", fontSize: "0.8rem" }}>收起</button>
+            )}
+          </div>
+          {hotFunds.map((f, i) => (
+            <div
+              key={f.code}
+              style={{ ...styles.hotFundItem, padding: "0.55rem 1rem" }}
+              onClick={() => fetchFund(f)}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+                <span style={{ fontSize: "0.75rem", fontWeight: 700, color: i < 3 ? "#f59e0b" : "#3f3f46", width: "1rem", textAlign: "center" as const }}>{i + 1}</span>
+                <div>
+                  <span style={{ color: "#e4e4e7", fontWeight: 600, marginRight: "0.5rem" }}>{f.name}</span>
+                  <span style={{ fontSize: "0.75rem", color: "#52525b" }}>{f.code}</span>
+                </div>
+              </div>
+              <Star
+                size={16}
+                fill={watchlist.find(w => w.code === f.code) ? "#f59e0b" : "none"}
+                color={watchlist.find(w => w.code === f.code) ? "#f59e0b" : "#3f3f46"}
+                style={{ cursor: "pointer", flexShrink: 0 }}
+                onClick={(e) => { e.stopPropagation(); toggleWatchlist(f); }}
+              />
+            </div>
+          ))}
         </div>
       )}
 
@@ -642,11 +678,11 @@ export default function Home() {
                     </div>
                   </div>
                   
-                  <button 
-                    style={styles.aiBtn} 
-                    onClick={() => fetchAiAnalysis(data.fund_code)}
+                  <button
+                    style={styles.aiBtn}
+                    onClick={() => setShowAiTeaser(v => !v)}
                   >
-                    ✨ AI 分析报告
+                    ✨ AI 深度诊断
                   </button>
                 </div>
               </div>
@@ -666,55 +702,90 @@ export default function Home() {
             </div>
           </div>
 
-          {/* AI Analysis Panel */}
-          {activeAiFundCode === data.fund_code && (
+          {/* AI Teaser Panel */}
+          {showAiTeaser && (
             <div style={styles.aiPanel}>
+              {/* Header */}
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", color: "#a78bfa", fontWeight: 800 }}>
-                  <ShieldCheck size={20} /> AI 深度解读分析报告
+                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", color: "#a78bfa", fontWeight: 800, fontSize: "1rem" }}>
+                  <ShieldCheck size={20} /> AI 深度诊断报告
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-                  <div style={{ fontSize: "0.75rem", color: "#71717a" }}>
-                    {aiData?.update_date ? `更新于 ${aiData.update_date}` : ""}
-                  </div>
-                  {aiData?.source && (
-                    <span style={{ 
-                      fontSize: "0.7rem", 
-                      color: "#a78bfa",
-                      background: "rgba(139, 92, 246, 0.15)",
-                      border: "1px solid rgba(139, 92, 246, 0.3)",
-                      padding: "0.15rem 0.5rem",
-                      borderRadius: "0.5rem",
-                      whiteSpace: "nowrap"
-                    }}>
-                      {aiData.source}
-                    </span>
-                  )}
+                <span style={{
+                  fontSize: "0.7rem", fontWeight: 700, letterSpacing: "0.05em",
+                  color: "#fbbf24", background: "rgba(251,191,36,0.12)",
+                  border: "1px solid rgba(251,191,36,0.3)",
+                  padding: "0.2rem 0.6rem", borderRadius: "2rem",
+                }}>
+                  即将上线
+                </span>
+              </div>
+
+              {/* Feature pills */}
+              <div style={{ display: "flex", flexWrap: "wrap" as const, gap: "0.4rem", marginBottom: "1.1rem" }}>
+                {["持仓风格诊断", "行业赛道解读", "风险等级评级", "买卖信号参考"].map(f => (
+                  <span key={f} style={{
+                    fontSize: "0.78rem", fontWeight: 600,
+                    color: "#c4b5fd", background: "rgba(139,92,246,0.12)",
+                    border: "1px solid rgba(139,92,246,0.25)",
+                    padding: "0.2rem 0.65rem", borderRadius: "2rem",
+                  }}>✦ {f}</span>
+                ))}
+              </div>
+
+              {/* Blurred mock content */}
+              <div style={{ position: "relative" as const, marginBottom: "1.1rem", userSelect: "none" as const }}>
+                <div style={{ filter: "blur(5px)", pointerEvents: "none" as const, opacity: 0.6 }}>
+                  <div style={{ height: "0.85rem", background: "#3f3f46", borderRadius: "4px", marginBottom: "0.55rem", width: "92%" }} />
+                  <div style={{ height: "0.85rem", background: "#3f3f46", borderRadius: "4px", marginBottom: "0.55rem", width: "78%" }} />
+                  <div style={{ height: "0.85rem", background: "#3f3f46", borderRadius: "4px", marginBottom: "0.55rem", width: "85%" }} />
+                  <div style={{ height: "0.85rem", background: "#3f3f46", borderRadius: "4px", width: "60%" }} />
+                </div>
+                <div style={{
+                  position: "absolute" as const, inset: 0,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: "1.5rem",
+                }}>
+                  🔒
                 </div>
               </div>
-              
-              {aiLoading ? (
-                <div style={{ color: "#71717a", fontSize: "0.9rem", fontStyle: "italic" }}>
-                  正在连接云端大脑，调取深度分析报告...
+
+              {/* Price */}
+              <div style={{
+                background: "linear-gradient(135deg, rgba(251,191,36,0.08) 0%, rgba(139,92,246,0.08) 100%)",
+                border: "1px solid rgba(251,191,36,0.25)",
+                borderRadius: "0.75rem",
+                padding: "0.65rem 1rem",
+                marginBottom: "0.9rem",
+                display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem",
+              }}>
+                <div style={{ fontSize: "1.3rem", fontWeight: 900, color: "#fbbf24", letterSpacing: "-0.02em", whiteSpace: "nowrap" as const }}>
+                  ¥19 <span style={{ fontSize: "0.85rem", fontWeight: 600, color: "#a1a1aa" }}>/ 年</span>
                 </div>
-              ) : (
-                <div style={{ ...styles.aiContent }}>
-                  <ReactMarkdown
-                    components={{
-                      h3: ({children}) => <div style={{...styles.aiTitle, marginTop: '1.2rem', fontSize: '1.05rem', borderLeft: '4px solid #8b5cf6', paddingLeft: '0.5rem'}}>{children}</div>,
-                      h4: ({children}) => <div style={{...styles.aiTitle, marginTop: '1rem', fontSize: '0.95rem', color: '#c4b5fd'}}>{children}</div>,
-                      p: ({children}) => <div style={{marginBottom: '0.8rem', lineHeight: 1.7}}>{children}</div>,
-                      ul: ({children}) => <ul style={{paddingLeft: '1.2rem', margin: '0.5rem 0', listStyleType: 'disc', color: '#8b5cf6'}}>{children}</ul>,
-                      li: ({children}) => <li style={{marginBottom: '0.3rem', color: '#d4d4d8'}}><span style={{color: '#d4d4d8'}}>{children}</span></li>,
-                      strong: ({children}) => <strong style={{color: '#fff', fontWeight: 700}}>{children}</strong>,
-                      hr: () => <hr style={{borderColor: '#27272a', margin: '1.5rem 0', borderTopWidth: '1px'}} />,
-                      blockquote: ({children}) => <blockquote style={{borderLeft: '4px solid #3f3f46', paddingLeft: '1rem', color: '#a1a1aa', fontStyle: 'italic', margin: '1rem 0'}}>{children}</blockquote>
-                    }}
-                  >
-                    {aiText}
-                  </ReactMarkdown>
-                </div>
-              )}
+                <span style={{
+                  fontSize: "0.72rem", fontWeight: 700,
+                  color: "#f87171", background: "rgba(239,68,68,0.1)",
+                  border: "1px solid rgba(239,68,68,0.25)",
+                  padding: "0.25rem 0.6rem", borderRadius: "2rem", whiteSpace: "nowrap" as const,
+                }}>
+                  早鸟价 · 限前 100 名
+                </span>
+              </div>
+
+              {/* CTA */}
+              <a
+                href={`mailto:${SALES_EMAIL}?subject=预约 AI 深度诊断&body=我想预约体验基金透视 AI 深度诊断功能`}
+                style={{
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: "0.5rem",
+                  padding: "0.65rem 1rem",
+                  borderRadius: "0.75rem",
+                  background: "linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%)",
+                  color: "#fff", fontSize: "0.9rem", fontWeight: 700,
+                  textDecoration: "none",
+                  boxShadow: "0 0 20px rgba(139,92,246,0.3)",
+                }}
+              >
+                立即预约体验 → {SALES_EMAIL}
+              </a>
             </div>
           )}
 
@@ -769,13 +840,13 @@ export default function Home() {
             <Info size={18} /> 重要提示
           </div>
           <div style={styles.mvpBannerText}>
-            当前版本为 MVP，可能存在速度较慢或者输出不稳定等情况。
-            如需更专业、更快、更稳定的服务，请联系销售团队获取支持
+            本产品持续迭代优化，致力于为您提供专业、精准的基金分析体验。
+            如需进一步了解或获取定制化服务，欢迎联系我们
             {SALES_EMAIL ? (
               <>
                 ：{" "}
                 <a style={styles.mvpBannerLink} href={`mailto:${SALES_EMAIL}`}>
-                  {SALES_EMAIL}。
+                  {SALES_EMAIL}
                 </a>
               </>
             ) : (
@@ -784,20 +855,24 @@ export default function Home() {
           </div>
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "1rem", color: "#a1a1aa" }}>
-          <Info size={18} />
-          <strong style={{ fontSize: "0.95rem", letterSpacing: "0.02em" }}>合规提示与风险声明</strong>
+        <div style={{ color: "#52525b", fontSize: "0.75rem", marginBottom: "0.5rem", fontWeight: 600, letterSpacing: "0.04em", textTransform: "uppercase" as const }}>
+          合规提示与风险声明
         </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem", fontSize: "0.85rem" }}>
-          <p style={{ margin: 0 }}>1. <strong>非官方数据</strong>：本工具仅根据基金季度报告披露的十大重仓股及实时行情进行数学估算，不代表基金真实净值，不构成投资建议。</p>
-          <p style={{ margin: 0 }}>2. <strong>AI生成声明</strong>：深度解读内容由 AI 预生成，仅供研究参考，不代表本平台立场。<strong>AI生成，仅供参考。</strong></p>
-          <p style={{ margin: 0 }}>3. <strong>局限性说明</strong>：估算未考虑重仓股以外的持仓、现金比例、调仓变动及管理成本。请以官方每日发布的净值为准。</p>
-          <p style={{ margin: 0 }}>4. <strong>风险提示</strong>：市场有风险，投资需谨慎。本程序不对任何投资损益负责。</p>
+        <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem", fontSize: "0.8rem" }}>
+          <p style={{ margin: 0 }}>1. <strong>非官方数据</strong>：本工具仅根据基金季度报告披露的重仓股及实时行情进行数学估算，不代表基金真实净值，不构成投资建议。</p>
+          <p style={{ margin: 0 }}>2. <strong>局限性说明</strong>：估算未考虑重仓股以外的持仓、现金比例、调仓变动及管理成本。请以官方每日发布的净值为准。</p>
+          <p style={{ margin: 0 }}>3. <strong>风险提示</strong>：市场有风险，投资需谨慎。本程序不对任何投资损益负责。</p>
         </div>
-        <div style={{ marginTop: "2rem", textAlign: "center" }}>
-          <a href="https://github.com/akfamily/akshare" target="_blank" style={{ color: "#3b82f6", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "0.4rem", fontWeight: 600 }}>
-            Data by AkShare <ExternalLink size={14} />
-          </a>
+        <div style={{ marginTop: "1rem", textAlign: "center" }}>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" as const, justifyContent: "center" }}>
+            <a href="https://github.com/akfamily/akshare" target="_blank" style={{ color: "#3b82f6", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "0.4rem", fontWeight: 600 }}>
+              Data by AkShare <ExternalLink size={14} />
+            </a>
+            <span style={{ color: "#3f3f46" }}>·</span>
+            <a href="https://finance.sina.com.cn" target="_blank" style={{ color: "#3b82f6", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "0.4rem", fontWeight: 600 }}>
+              新浪财经 <ExternalLink size={14} />
+            </a>
+          </span>
         </div>
       </footer>
 

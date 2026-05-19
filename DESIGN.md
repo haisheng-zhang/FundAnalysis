@@ -1,68 +1,100 @@
-# 设计说明
+# 设计文档
 
-## 核心架构
+## 架构概览
 
-项目采用前后端分离架构：
+前后端分离，后端 Render，前端 Vercel。
 
-- **后端 (Backend)**: 基于 Python FastAPI，负责数据抓取、实时估值计算及 AI 分析生成。
-- **前端 (Frontend)**: 基于 Next.js (App Router)，负责展示基金持仓、估算涨幅及 AI 深度报告。
+```
+用户浏览器
+    │
+    ├── GET /api/fund/{code}        ← 估值 + 持仓
+    ├── GET /api/search?q=          ← 基金搜索
+    ├── GET /api/hot-funds          ← 热门基金
+    └── GET /api/ai-analysis/{code} ← AI 分析（后端已就绪，前端暂为预约入口）
+            │
+        FastAPI (Render)
+            │
+            ├── AkShare ──────────── 基金持仓（季报）、基金搜索列表、热门排名
+            └── 新浪财经 ─────────── 实时股票行情（批量，全品种含科创板）
+```
 
 ## 技术栈
 
-| 部分 | 技术 | 说明 |
-|------|------|------|
-| 后端框架 | Python (FastAPI) | 高性能异步 Web 框架 |
-| 数据源 | AkShare / 雪球 API | 实时股票行情及基金持仓数据 |
-| AI 模型 | DeepSeek R1 (via OpenRouter) | 基金深度分析与持仓解读 |
-| 数据处理 | Pandas / ThreadPoolExecutor | 高效矩阵运算与并发数据抓取 |
-| 前端框架 | Next.js (React) | 现代化的前端开发框架 |
-| 样式/渲染 | Tailwind CSS / React Markdown | 响应式 UI 与富文本渲染 |
+| 层 | 技术 |
+|----|------|
+| 后端框架 | Python / FastAPI |
+| 数据源 | AkShare（持仓/搜索/排名）、新浪财经（行情） |
+| AI 模型 | OpenRouter（DeepSeek/StepFun 等，后端已集成，前端待开放） |
+| 数据处理 | Pandas |
+| 前端框架 | Next.js 14 (App Router) |
+| UI | 内联样式（暗黑主题）+ lucide-react 图标 |
+| 部署 | Vercel（前端）+ Render（后端） |
 
-## 关键设计
+## 关键设计决策
 
-### 1. 实时行情获取策略
-  - 当用户请求某基金估值时，后端解析出其十大重仓股代码。
-  - 使用 `ThreadPoolExecutor` (线程池) 并发请求这 10 只股票的实时行情。
-  - **优势**: 响应速度快 (通常 < 300ms)，且不浪费 API 额度，仅查询用户关心的股票。
-  - **交易时间感知**: 仅在 A 股交易时段调用实时接口，非交易时段返回静态数据或收盘数据。
+### 1. 行情数据源：新浪财经批量接口
 
-### 2. AI 深度分析系统
-- **触发机制**: 用户点击“AI 分析报告”按钮时触发。
-- **缓存策略**:
-  - **文件缓存**: 生成的报告存储在 `backend/data/ai_analysis/{fund_code}.json`。
-  - **有效期**: 报告默认缓存 7 天。7 天内的请求直接返回缓存内容（响应 < 50ms）。
-  - **过期清理**: 后台启动定时任务，每日凌晨自动清理过期文件。
+`http://hq.sinajs.cn/list=sh600519,sz300308,...`
 
-### 3. 基金涨幅估算逻辑
-- **数据获取**: 根据输入的基金代码，实时抓取该基金最新的季报前十大重仓股。
-- **计算公式**: `基金估算涨幅 = Σ (重仓股涨跌幅 * 该股占净值比例) / Σ (前十大重仓股占净值比例) * (前十大重仓股总占比)`
-  - *注：这是一种近似估算法，未考虑剩余持仓及盘中调仓。*
+- 一次 HTTP 请求获取所有持仓股行情，无需并发
+- 支持全品种（主板、创业板、科创板 688xxx）
+- 非交易时段（午间、收盘后）返回最后成交价，涨跌幅仍有效
+- 雪球接口（原方案）在 Render US 服务器对科创板股票返回 `'data'` KeyError，已弃用
 
-### 4. 前后端通信与部署
-- **Render (后端)**: 部署 FastAPI 服务。
-- **Vercel (前端)**: 部署 Next.js 应用，自动处理 HTTPS 和 CDN。
-- **跨域 (CORS)**: 后端配置允许来自 Vercel 域名的跨域请求。
+### 2. 缓存策略
 
-### 5. 扩展性设计
-- **支付集成**: 预留了 Webhook 接口位置，未来可接入 Lemon Squeezy 实现高级会员功能 (如无限次 AI 分析)。
+| 数据 | 缓存位置 | TTL | 说明 |
+|------|----------|-----|------|
+| 基金持仓（季报） | 内存 dict | 24小时 | 季报至多季度更新，无需频繁拉取 |
+| 基金搜索列表 | 内存 DataFrame | 启动加载，不过期 | 26000+ 只基金代码+名称 |
+| 热门基金 | 内存 list | 每日 | 按日期比对失效 |
+| AI 分析报告 | 磁盘 JSON | 7天 | `data/ai_analysis/{code}.json` |
+
+所有内存缓存随进程重启清空，无持久化依赖。
+
+### 3. 估值计算公式
+
+```
+持仓权重_i  = 占净值比例_i / 100
+贡献_i     = 持仓权重_i × 涨跌幅_i
+估算涨幅   = Σ贡献_i / Σ持仓权重_i
+```
+
+仅基于季报披露的重仓股，未考虑：其余持仓、现金比例、盘中调仓。
+
+### 4. 交易时间
+
+A股交易时段（北京时间）：
+- 上午：09:30 – 11:30
+- 下午：13:00 – 15:00
+- 工作日（周一至周五，不含节假日）
+
+前端在交易时段内每60秒静默刷新当前基金估值；后端日志标注 `trading=True/False`。
+
+### 5. AI 分析（后端已就绪，前端预约模式）
+
+- 后端 `/api/ai-analysis/{code}` 完整实现，接入 OpenRouter
+- 前端当前展示预约入口（¥19/年早鸟），不调用后端接口
+- 开放时只需取消前端 `page.tsx` 中的注释块，无需改后端
 
 ## 目录结构
 
-```text
-fund/
-├── backend/            # 后端 Python 代码
-│   ├── api.py          # FastAPI 入口与生命周期管理
-│   ├── fund_estimation.py # 核心估值逻辑、AI生成与缓存管理
-│   ├── prompt_config.py   # AI 提示词模板
-│   ├── data/           # 本地数据持久化目录
-│   │   └── ai_analysis/ # AI 报告 JSON 缓存
-│   └── requirements.txt # 依赖列表
-├── frontend/           # 前端 Next.js 代码
-│   ├── app/            # 页面与布局
-│   │   ├── page.tsx    # 主页逻辑
-│   │   └── layout.tsx  # 全局布局
-│   └── ...
-├── README.md           # 项目总览
-├── DESIGN.md           # 设计文档
-└── DEPLOY.md           # 部署指南
+```
+FundAnalysis/
+├── backend/
+│   ├── api.py                  # FastAPI 路由（4个端点）
+│   ├── fund_estimation.py      # 核心逻辑：持仓、行情、估值、AI、热门基金
+│   ├── prompt_config.py        # AI 提示词模板
+│   ├── requirements.txt
+│   └── data/
+│       └── ai_analysis/        # AI 报告磁盘缓存（7天过期自动清理）
+├── frontend/
+│   ├── app/
+│   │   ├── page.tsx            # 主页（单页应用）
+│   │   └── layout.tsx          # 全局布局
+│   ├── .env.local.example
+│   └── package.json
+├── README.md
+├── DESIGN.md
+└── DEPLOY.md
 ```

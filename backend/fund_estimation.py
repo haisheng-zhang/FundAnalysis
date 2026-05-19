@@ -39,6 +39,14 @@ os.makedirs(_AI_ANALYSIS_CACHE_DIR, exist_ok=True)
 _IP_REQUEST_COUNT = {}  # IP请求计数 {ip: (last_date, count)}
 _IP_REQUEST_LOCK = threading.Lock()  # IP请求计数锁
 
+# 7. 基金持仓缓存（内存，持仓季报数据，24小时有效）
+# key: fund_code, value: {"df": DataFrame, "quarter": str, "cached_at": datetime}
+_HOLDINGS_CACHE: dict = {}
+_HOLDINGS_CACHE_LOCK = threading.Lock()
+_HOLDINGS_CACHE_TTL = 60 * 60 * 24  # 24h in seconds
+
+
+
 # 配置日志记录
 logging.basicConfig(
     level=logging.INFO,
@@ -498,149 +506,100 @@ def search_funds(query: str, limit: int = 10) -> list:
     
     return [{"code": row["基金代码"], "name": row["基金简称"]} for _, row in results.iterrows()]
 
-import concurrent.futures
+
+
+def _sina_batch(stock_codes: List[str]) -> dict:
+    """
+    新浪财经批量行情接口，支持全品种（含科创板688xxx）。
+    返回 {code: change_pct}，失败的股票不出现在结果里。
+    """
+    def to_sina(code):
+        return f"sh{code}" if code.startswith("6") else f"sz{code}"
+
+    symbols = ",".join(to_sina(c) for c in stock_codes)
+    url = f"http://hq.sinajs.cn/list={symbols}"
+    try:
+        resp = requests.get(url, headers={"Referer": "http://finance.sina.com.cn"}, timeout=10)
+        resp.encoding = "gbk"
+        result = {}
+        for line in resp.text.strip().split("\n"):
+            m = re.match(r'var hq_str_\w{2}(\d+)="([^"]*)"', line)
+            if not m:
+                continue
+            code = m.group(1).zfill(6)
+            fields = m.group(2).split(",")
+            if len(fields) < 4:
+                continue
+            try:
+                prev_close = float(fields[2])
+                current = float(fields[3])
+                if prev_close > 0 and current > 0:
+                    result[code] = round((current - prev_close) / prev_close * 100, 2)
+            except ValueError:
+                continue
+        logging.warning(f"[sina_batch] ok={len(result)} total={len(stock_codes)}")
+        return result
+    except Exception as e:
+        logging.warning(f"[sina_batch] failed: {e}")
+        return {}
+
 
 def get_stock_spot(stock_codes: List[str]) -> Tuple[Optional[pd.DataFrame], bool]:
-    """ 
-    使用雪球 API，并发获取指定股票列表的实时行情。
-    返回一个包含实时涨跌幅的 DataFrame。
-    """
-    now = _now_cn()
-    tz = getattr(now.tzinfo, "key", str(now.tzinfo))
+    """新浪批量接口获取全部持仓行情，支持全品种（含科创板688xxx）。"""
     logging.warning(
-        f"[get_stock_spot] start codes={len(stock_codes)} sample={stock_codes[:3]} now={now.isoformat()} tz={tz} trading={is_trading_time()} reason={get_trading_time_reason()}"
+        f"[get_stock_spot] start codes={len(stock_codes)} trading={is_trading_time()} reason={get_trading_time_reason()}"
     )
-
-    # TODO: TEST ONLY
-    # if not is_trading_time():
-    #     # 非交易时间，返回空 DataFrame，避免不必要的 API 调用
-    #     return pd.DataFrame(columns=["代码", "名称", "涨跌幅"]), False
-
-    results = []
-    
-    def _to_float(value) -> Optional[float]:
-        if value is None:
-            return None
-        if isinstance(value, (int, float)):
-            return float(value)
-        s = str(value).strip()
-        if not s or s in {"--", "None", "nan"}:
-            return None
-        s = s.replace("%", "").strip()
-        try:
-            return float(s)
-        except Exception:
-            return None
-
-    def _extract_xq_change_and_name(stock_df: pd.DataFrame) -> Tuple[Optional[str], Optional[float]]:
-        if stock_df is None or stock_df.empty:
-            return None, None
-
-        cols = set(map(str, stock_df.columns))
-        if {"item", "value"}.issubset(cols):
-            items = stock_df["item"].astype(str).tolist()
-            values = stock_df["value"].tolist()
-            data = dict(zip(items, values))
-
-            name = data.get("名称") or data.get("name")
-            change = (
-                data.get("涨幅")
-                or data.get("涨跌幅")
-                or data.get("涨跌幅(%)")
-                or data.get("percent")
-                or data.get("pct_chg")
-            )
-            return (str(name) if name is not None else None), _to_float(change)
-
-        name = None
-        if "name" in cols:
-            try:
-                name = stock_df["name"].iloc[0]
-            except Exception:
-                name = None
-        elif "名称" in cols:
-            try:
-                name = stock_df["名称"].iloc[0]
-            except Exception:
-                name = None
-
-        change_pct = None
-        for key in ["percent", "pct_chg", "涨幅", "涨跌幅", "涨跌幅(%)"]:
-            if key in cols:
-                try:
-                    change_pct = _to_float(stock_df[key].iloc[0])
-                    break
-                except Exception:
-                    continue
-
-        return (str(name) if name is not None else None), change_pct
-
-    def fetch_stock_data(code):
-        try:
-            # 雪球接口需要股票代码前加上 SH 或 SZ 前缀
-            prefix = "SH" if code.startswith('6') else "SZ"
-            xq_symbol = f"{prefix}{code}"
-            stock_df = ak.stock_individual_spot_xq(symbol=xq_symbol)
-            name, change_pct = _extract_xq_change_and_name(stock_df)
-            if change_pct is None:
-                raise KeyError("change_pct not found")
-
-            return {"代码": code, "名称": name, "涨跌幅": change_pct}
-        except Exception as e:
-            logging.warning(f"[get_stock_spot] 获取股票 {code} 行情失败: {e}")
-            return None
-
-    # 使用线程池并发获取数据
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_code = {executor.submit(fetch_stock_data, code): code for code in stock_codes}
-        for future in concurrent.futures.as_completed(future_to_code):
-            result = future.result()
-            if result:
-                results.append(result)
-    
-    if not results:
-        logging.warning(f"[get_stock_spot] done ok=0 total={len(stock_codes)}")
+    sina_data = _sina_batch(stock_codes)
+    if not sina_data:
         return pd.DataFrame(columns=["代码", "名称", "涨跌幅"]), False
-
+    results = [{"代码": c, "名称": None, "涨跌幅": v} for c, v in sina_data.items()]
     logging.warning(f"[get_stock_spot] done ok={len(results)} total={len(stock_codes)}")
-    df_spot = pd.DataFrame(results)
-    return df_spot, True
+    return pd.DataFrame(results), True
 
 
 def get_fund_top10_with_change(fund_code: str, api_mode: bool = False):
     """
-    核心算法：获取最新持仓 -> 匹配实时行情 -> 估算基金涨幅。
+    核心算法：获取最新持仓（内存缓存24h）-> 匹配实时行情 -> 估算基金涨幅。
     """
-    today = date.today()
-    years_to_try = [str(today.year - i) for i in range(3)]
-
+    # --- 持仓缓存读取 ---
     df_hold = None
     found_quarter = None
+    with _HOLDINGS_CACHE_LOCK:
+        cached = _HOLDINGS_CACHE.get(fund_code)
+        if cached:
+            age = (_now_cn() - cached["cached_at"]).total_seconds()
+            if age < _HOLDINGS_CACHE_TTL:
+                df_hold = cached["df"]
+                found_quarter = cached["quarter"]
+                logging.warning(f"[holdings_cache] hit fund_code={fund_code} quarter={found_quarter} age={int(age)}s")
 
-    for year in years_to_try:
-        try:
-            df = fetch_with_retry(lambda y=year: ak.fund_portfolio_hold_em(symbol=fund_code, date=y))
-            if df is None or df.empty: continue
+    # --- 缓存未命中：从 akshare 拉取 ---
+    if df_hold is None:
+        today = date.today()
+        years_to_try = [str(today.year - i) for i in range(3)]
+        for year in years_to_try:
+            try:
+                df = fetch_with_retry(lambda y=year: ak.fund_portfolio_hold_em(symbol=fund_code, date=y))
+                if df is None or df.empty: continue
+                df.columns = df.columns.str.strip()
+                actual_quarters = df["季度"].unique().tolist()
+                def parse_q(label):
+                    nums = re.findall(r'\d+', label)
+                    return (int(nums[0]), int(nums[1])) if len(nums) >= 2 else (0, 0)
+                latest_quarter = max(actual_quarters, key=parse_q)
+                df_q = df[df["季度"] == latest_quarter]
+                if not df_q.empty:
+                    df_hold = df_q.copy()
+                    found_quarter = latest_quarter
+                    break
+            except: continue
 
-            df.columns = df.columns.str.strip()
-            actual_quarters = df["季度"].unique().tolist()
-            
-            # 排序逻辑：寻找最新季度的持仓数据
-            def parse_q(label):
-                nums = re.findall(r'\d+', label)
-                return (int(nums[0]), int(nums[1])) if len(nums) >= 2 else (0, 0)
+        if df_hold is None or df_hold.empty:
+            raise ValueError(f"❌ 未找到基金 {fund_code} 的任何持仓数据")
 
-            latest_quarter = max(actual_quarters, key=parse_q)
-            df_q = df[df["季度"] == latest_quarter]
-
-            if not df_q.empty:
-                df_hold = df_q.copy()
-                found_quarter = latest_quarter
-                break
-        except: continue
-
-    if df_hold is None or df_hold.empty:
-        raise ValueError(f"❌ 未找到基金 {fund_code} 的任何持仓数据")
+        with _HOLDINGS_CACHE_LOCK:
+            _HOLDINGS_CACHE[fund_code] = {"df": df_hold, "quarter": found_quarter, "cached_at": _now_cn()}
+        logging.warning(f"[holdings_cache] miss fund_code={fund_code} quarter={found_quarter} — fetched and cached")
 
     df_hold["股票代码"] = df_hold["股票代码"].astype(str).str.zfill(6)
     stock_codes = df_hold["股票代码"].tolist()
@@ -651,7 +610,6 @@ def get_fund_top10_with_change(fund_code: str, api_mode: bool = False):
 
     if not is_live:
         logging.warning(f"[get_fund_top10_with_change] spot not live fund_code={fund_code} reason={get_trading_time_reason()}")
-        return df_hold[["序号", "股票代码", "股票名称", "占净值比例"]].copy(), None, found_quarter
 
     # 数据合并与估算计算
     df_result = df_hold[["序号", "股票代码", "股票名称", "占净值比例"]].merge(
@@ -659,6 +617,7 @@ def get_fund_top10_with_change(fund_code: str, api_mode: bool = False):
     ).drop(columns=["代码"])
 
     df_result.rename(columns={"涨跌幅": "实时涨跌幅(%)"}, inplace=True)
+    df_result["实时涨跌幅(%)"] = pd.to_numeric(df_result["实时涨跌幅(%)"], errors="coerce")
     df_result["权重"] = pd.to_numeric(df_result["占净值比例"].astype(str).str.replace("%", "").str.strip(), errors="coerce") / 100
     df_result["贡献涨跌幅(%)"] = (df_result["实时涨跌幅(%)"] * df_result["权重"]).round(4)
 
@@ -763,57 +722,61 @@ def schedule_cleanup_task():
 schedule_cleanup_task()
 
 
+def _base_fund_name(name: str) -> str:
+    """去除基金名称末尾的份额类别后缀，用于去重。"""
+    return re.sub(r'[\(（]?[A-Ea-e][类\)）]?$|联接[A-Ea-e]$', '', name).strip()
+
+
 def get_hot_funds() -> List[dict]:
-    """
-    获取热门基金列表（过去一个月涨幅最高的三只基金），并使用每日缓存。
-    """
+    """近1月涨幅前10，去除同系列A/C重复份额，每日缓存。"""
     global _HOT_FUNDS_CACHE, _HOT_FUNDS_CACHE_DATE
 
-    today = date.today()
-
-    # 检查缓存
     with _HOT_FUNDS_LOCK:
-        if _HOT_FUNDS_CACHE and _HOT_FUNDS_CACHE_DATE == today:
+        if _HOT_FUNDS_CACHE and _HOT_FUNDS_CACHE_DATE == date.today():
             return _HOT_FUNDS_CACHE
 
-    # 缓存未命中或已过期，执行数据获取
     try:
-        fund_rank_df = fetch_with_retry(lambda: ak.fund_open_fund_rank_em())
-        
-        if '近1月' not in fund_rank_df.columns:
-            raise ValueError("排名数据中缺少'近1月'列")
-            
-        fund_rank_df['近1月'] = pd.to_numeric(fund_rank_df['近1月'], errors='coerce')
-        fund_rank_df = fund_rank_df.dropna(subset=['近1月'])
+        df = fetch_with_retry(lambda: ak.fund_open_fund_rank_em())
+        if '近1月' not in df.columns:
+            raise ValueError("缺少'近1月'列")
 
-        top_3_funds = fund_rank_df.sort_values(by='近1月', ascending=False).head(3)
+        df['近1月'] = pd.to_numeric(df['近1月'], errors='coerce')
+        df = df.dropna(subset=['近1月']).sort_values('近1月', ascending=False)
 
-        hot_funds = [
-            {"code": row['基金代码'], "name": row['基金简称']}
-            for _, row in top_3_funds.iterrows()
-        ]
-        
+        # 去重：同一基础名称只保留近1月最高的一只
+        seen: set = set()
+        hot_funds = []
+        for _, row in df.iterrows():
+            base = _base_fund_name(row['基金简称'])
+            if base in seen:
+                continue
+            seen.add(base)
+            hot_funds.append({"code": row['基金代码'], "name": row['基金简称']})
+            if len(hot_funds) == 10:
+                break
+
         if not hot_funds:
-            raise ValueError("未能从 akshare 提取出热门基金数据")
+            raise ValueError("未能提取热门基金")
 
-        # 更新缓存
         with _HOT_FUNDS_LOCK:
             _HOT_FUNDS_CACHE = hot_funds
-            _HOT_FUNDS_CACHE_DATE = today
-
+            _HOT_FUNDS_CACHE_DATE = date.today()
         return hot_funds
-    
+
     except Exception as e:
-        print(f"  ⚠️ [get_hot_funds] 失败: {e}")
-        # 在异常情况下，仍可考虑返回旧缓存（如果有）或静态数据
+        logging.warning(f"[get_hot_funds] 失败: {e}")
         with _HOT_FUNDS_LOCK:
             if _HOT_FUNDS_CACHE:
-                print("  ↪️  返回旧的缓存数据")
                 return _HOT_FUNDS_CACHE
-        
-        print("  ↪️  返回静态兜底数据")
         return [
-            {"code": "020465", "name": "招商中证半导体产业ETF联接C"},
-            {"code": "001508", "name": "富国中证红利指数增强A"},
-            {"code": "161725", "name": "招商中证白酒"},
+            {"code": "110011", "name": "易方达中小盘混合"},
+            {"code": "161725", "name": "招商中证白酒指数"},
+            {"code": "000961", "name": "天弘沪深300ETF联接A"},
+            {"code": "163406", "name": "兴全合润混合"},
+            {"code": "001975", "name": "景顺长城新兴成长混合"},
+            {"code": "270042", "name": "广发纳斯达克100ETF联接A"},
+            {"code": "006228", "name": "中欧医疗健康混合A"},
+            {"code": "001643", "name": "汇添富全球消费混合"},
+            {"code": "000697", "name": "信达澳银新能源产业股票"},
+            {"code": "001104", "name": "农银汇理新能源主题股票"},
         ]

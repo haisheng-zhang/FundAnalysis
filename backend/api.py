@@ -75,7 +75,7 @@ def api_search(q: str):
 
 @app.get("/api/hot-funds")
 def api_hot_funds():
-    """获取热门基金列表（过去一个月涨幅最高的三只基金）"""
+    """获取热门基金列表（过去一个月涨幅前10，已去除同系列重复份额）"""
     return get_hot_funds()
 
 
