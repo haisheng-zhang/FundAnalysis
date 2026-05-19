@@ -44,6 +44,12 @@ app.add_middleware(
 )
 
 
+@app.get("/health")
+def health_check():
+    """健康检查端点，供 UptimeRobot 等监控服务使用"""
+    return {"status": "ok"}
+
+
 @app.get("/api/fund/{fund_code}")
 def api_fund(request: Request, fund_code: str):
     """根据基金代码返回十大重仓 + 估算涨幅。"""
