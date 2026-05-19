@@ -44,7 +44,7 @@ app.add_middleware(
 )
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health_check():
     """健康检查端点，供 UptimeRobot 等监控服务使用"""
     return {"status": "ok"}
