@@ -118,7 +118,7 @@ def generate_realtime_ai_analysis(fund_code: str) -> dict:
                 fund_name = name_match.iloc[0]
     
     # 获取基金持仓数据
-    df_result, estimated_change, found_quarter = get_fund_top10_with_change(fund_code, api_mode=True)
+    df_result, estimated_change, found_quarter = get_fund_top10_with_change(fund_code)
     
     # 准备持仓数据
     holdings_info = []
@@ -144,6 +144,12 @@ def get_ai_analysis(fund_code: str, client_ip: str = "default"):
     """
     # 检查IP请求次数限制
     with _IP_REQUEST_LOCK:
+        today = date.today()
+        # Evict stale entries (Bug #3 fix)
+        stale_ips = [ip for ip, (d, _) in _IP_REQUEST_COUNT.items() if d != today]
+        for ip in stale_ips:
+            del _IP_REQUEST_COUNT[ip]
+
         if client_ip in _IP_REQUEST_COUNT:
             # 检查今天是否已经超过限制
             last_request_date, count = _IP_REQUEST_COUNT[client_ip]
@@ -288,7 +294,6 @@ def extract_analysis_sections(content: str) -> List[dict]:
     
     extracted_sections = []
     for section in sections:
-        import re
         match = re.search(section["pattern"], content, re.IGNORECASE)
         if match:
             # 清理内容，去除标题部分
@@ -415,8 +420,15 @@ def classify_risk_level(holdings: list) -> str:
 
 
 def is_high_concentration(holdings: list) -> bool:
-    """判断是否行业集中度高"""
-    return len(set([h["name"][:2] for h in holdings if h["name"]])) < len(holdings) / 2
+    """判断是否持仓集中度高 (基于权重赫芬达尔指数，非行业分类)"""
+    if not holdings:
+        return False
+    total = sum(h["weight_pct"] for h in holdings)
+    if total == 0:
+        return False
+    hhi = sum((h["weight_pct"] / total) ** 2 for h in holdings)
+    # HHI > 0.2 indicates moderate-to-high concentration
+    return hhi > 0.2
 
 
 def calculate_top3_concentration(holdings: list) -> float:
@@ -427,8 +439,15 @@ def calculate_top3_concentration(holdings: list) -> float:
 
 
 def count_unique_sectors(holdings: list) -> int:
-    """计算不同行业数量"""
-    return len(set([h["name"][:2] for h in holdings if h["name"]]))
+    """计算持仓多样性 (基于权重分布，非行业分类)"""
+    if not holdings:
+        return 0
+    # Count distinct weight buckets (5% increments) as proxy for diversification
+    weight_buckets = set()
+    for h in holdings:
+        bucket = int(h["weight_pct"] / 5)
+        weight_buckets.add(bucket)
+    return len(weight_buckets)
 
 
 def describe_holdings_logic(holdings: list) -> str:
@@ -450,17 +469,19 @@ def describe_investment_thesis(holdings: list) -> str:
 
 
 def calculate_risk_score(holdings: list) -> float:
-    """计算风险分数"""
+    """计算风险分数 (0-1 scale)"""
     if not holdings:
         return 0.0
-    return sum([h["weight_pct"] for h in holdings]) / len(holdings)
+    avg_weight_pct = sum([h["weight_pct"] for h in holdings]) / len(holdings)
+    # Normalize: assume max reasonable avg weight is 20%
+    return min(avg_weight_pct / 20.0, 1.0)
 
 
-def describe_market_factors() -> str:
-    """描述市场影响因素"""
-    import random
+def describe_market_factors(fund_code: str = "") -> str:
+    """描述市场影响因素 (deterministic per fund code)"""
     factors = ["宏观经济数据", "政策面变化", "海外市场波动", "资金流向"]
-    return random.choice(factors)
+    idx = int(hashlib.md5(fund_code.encode()).hexdigest(), 16) % len(factors)
+    return factors[idx]
 
 
 def describe_long_term_outlook(holdings: list) -> str:
@@ -473,6 +494,12 @@ def describe_key_factors_to_monitor(holdings: list) -> str:
     """描述需要关注的因素"""
     return "基金重仓股的业绩表现、行业政策变化及市场流动性"
 
+
+
+def _parse_quarter_key(label: str) -> Tuple[int, int]:
+    """Parse quarter label like '2024年第3季度' to (2024, 3)."""
+    nums = re.findall(r'\d+', label)
+    return (int(nums[0]), int(nums[1])) if len(nums) >= 2 else (0, 0)
 
 
 def refresh_fund_list_cache():
@@ -557,7 +584,7 @@ def get_stock_spot(stock_codes: List[str]) -> Tuple[Optional[pd.DataFrame], bool
     return pd.DataFrame(results), True
 
 
-def get_fund_top10_with_change(fund_code: str, api_mode: bool = False):
+def get_fund_top10_with_change(fund_code: str):
     """
     核心算法：获取最新持仓（内存缓存24h）-> 匹配实时行情 -> 估算基金涨幅。
     """
@@ -583,16 +610,15 @@ def get_fund_top10_with_change(fund_code: str, api_mode: bool = False):
                 if df is None or df.empty: continue
                 df.columns = df.columns.str.strip()
                 actual_quarters = df["季度"].unique().tolist()
-                def parse_q(label):
-                    nums = re.findall(r'\d+', label)
-                    return (int(nums[0]), int(nums[1])) if len(nums) >= 2 else (0, 0)
-                latest_quarter = max(actual_quarters, key=parse_q)
+                latest_quarter = max(actual_quarters, key=_parse_quarter_key)
                 df_q = df[df["季度"] == latest_quarter]
                 if not df_q.empty:
                     df_hold = df_q.copy()
                     found_quarter = latest_quarter
                     break
-            except: continue
+            except Exception as e:
+                logging.warning(f"[holdings_fetch] year={year} fund_code={fund_code} error={e}")
+                continue
 
         if df_hold is None or df_hold.empty:
             raise ValueError(f"❌ 未找到基金 {fund_code} 的任何持仓数据")
@@ -621,11 +647,12 @@ def get_fund_top10_with_change(fund_code: str, api_mode: bool = False):
     df_result["权重"] = pd.to_numeric(df_result["占净值比例"].astype(str).str.replace("%", "").str.strip(), errors="coerce") / 100
     df_result["贡献涨跌幅(%)"] = (df_result["实时涨跌幅(%)"] * df_result["权重"]).round(4)
 
-    top10_weight = float(df_result["权重"].sum()) if "权重" in df_result.columns else 0.0
-    top10_contribution = float(df_result["贡献涨跌幅(%)"].sum())
-
-    if top10_weight > 0:
-        estimated_change = top10_contribution / top10_weight
+    # Bug #1 fix: Handle case where Sina data is completely missing (all NaN)
+    valid = df_result["实时涨跌幅(%)"].notna()
+    if valid.any():
+        valid_weights = df_result.loc[valid, "权重"].sum()
+        valid_contributions = df_result.loc[valid, "贡献涨跌幅(%)"].sum()
+        estimated_change = valid_contributions / valid_weights if valid_weights > 0 else None
     else:
         estimated_change = None
 
@@ -633,7 +660,7 @@ def get_fund_top10_with_change(fund_code: str, api_mode: bool = False):
 
 def get_fund_top10_json(fund_code: str) -> dict:
     """包装业务逻辑，返回前端友好的 JSON 结构。"""
-    df_result, estimated_change, found_quarter = get_fund_top10_with_change(fund_code, api_mode=True)
+    df_result, estimated_change, found_quarter = get_fund_top10_with_change(fund_code)
     
     # 匹配基金简称
     fund_name = "未知基金"
