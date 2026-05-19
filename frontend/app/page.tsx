@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 // import ReactMarkdown from "react-markdown"; // AI feature paused
 import {
   Search, Star,
-  Info, ExternalLink, X, ShieldCheck, ChevronDown, ChevronUp
+  Info, ExternalLink, X, ShieldCheck, ChevronDown, ChevronUp, Copy
 } from "lucide-react";
 
 // --- Types ---
@@ -637,47 +637,48 @@ export default function Home() {
         <div style={{ animation: "fadeIn 0.4s ease-out" }}>
           {/* Fund Info Card - 80/20 Two-Column Layout */}
           <div style={{ ...styles.card, background: "linear-gradient(135deg, #18181b 0%, #121216 100%)", padding: "0.5rem 1.1rem" }}>
-            <div style={{ display: "flex", width: "100%", alignItems: "center" }}>
-              {/* Left Column: 75% */}
-              <div style={{ width: "75%", textAlign: "left" }}>
-                <a 
-                  href={`https://fund.eastmoney.com/${data.fund_code}.html`} 
-                  target="_blank" 
-                  style={{ 
-                    textDecoration: "none", 
+            <div style={{ display: "flex", width: "100%", alignItems: "center", gap: "0.5rem" }}>
+              {/* Left Column */}
+              <div style={{ flex: 1, minWidth: 0, textAlign: "left" }}>
+                <a
+                  href={`https://fund.eastmoney.com/${data.fund_code}.html`}
+                  target="_blank"
+                  style={{
+                    textDecoration: "none",
                     color: "#3b82f6",
-                    fontSize: "1.1rem", 
-                    fontWeight: 800, 
+                    fontSize: "1.1rem",
+                    fontWeight: 800,
                     letterSpacing: "-0.01em",
                     display: "inline",
                     lineHeight: 1.2
                   }}
                 >
                   {data.fund_name || "未知基金"}
-                  <ExternalLink 
-                    size={14} 
-                    color="currentColor" 
-                    style={{ 
-                      display: "inline-block", 
-                      verticalAlign: "middle", 
+                  <ExternalLink
+                    size={14}
+                    color="currentColor"
+                    style={{
+                      display: "inline-block",
+                      verticalAlign: "middle",
                       marginLeft: "4px",
                       opacity: 0.8,
                       position: "relative",
                       top: "-1px"
-                    }} 
+                    }}
                   />
                 </a>
-                <div style={{ display: "flex", alignItems: "center", gap: "0.8rem", marginTop: "0.4rem" }}>
+                {/* Row 2: code + star */}
+                <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", marginTop: "0.3rem" }}>
                   <span style={{ color: "#71717a", fontWeight: 600, fontSize: "1.05rem" }}>{data.fund_code}</span>
-                  <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
-                    <div 
-                      onClick={() => toggleWatchlist({ code: data.fund_code, name: data.fund_name || "未知基金" })} 
-                      style={{ cursor: "pointer", display: "flex", alignItems: "center" }}
-                    >
-                      {watchlist.find(w => w.code === data.fund_code) ? <Star size={20} fill="#f59e0b" color="#f59e0b" /> : <Star size={20} color="#3f3f46" />}
-                    </div>
+                  <div
+                    onClick={() => toggleWatchlist({ code: data.fund_code, name: data.fund_name || "未知基金" })}
+                    style={{ cursor: "pointer", display: "flex", alignItems: "center" }}
+                  >
+                    {watchlist.find(w => w.code === data.fund_code) ? <Star size={20} fill="#f59e0b" color="#f59e0b" /> : <Star size={20} color="#3f3f46" />}
                   </div>
-                  
+                </div>
+                {/* Row 3: AI button on its own line */}
+                <div style={{ marginTop: "0.4rem" }}>
                   <button
                     style={styles.aiBtn}
                     onClick={() => setShowAiTeaser(v => !v)}
@@ -687,13 +688,14 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* Right Column: 25% */}
-              <div style={{ width: "25%", textAlign: "right", display: "flex", justifyContent: "flex-end", alignItems: "center" }}>
-                <div style={{ 
-                  fontSize: "1.85rem", 
-                  fontWeight: 900, 
+              {/* Right Column: % number, fixed width, won't shrink */}
+              <div style={{ flexShrink: 0, textAlign: "right" }}>
+                <div style={{
+                  fontSize: "1.85rem",
+                  fontWeight: 900,
                   color: (data.estimated_change || 0) >= 0 ? "#ef4444" : "#10b981",
-                  display: "flex", alignItems: "center", letterSpacing: "-0.02em"
+                  letterSpacing: "-0.02em",
+                  whiteSpace: "nowrap" as const,
                 }}>
                   {data.estimated_change != null ? (data.estimated_change >= 0 ? "+" : "-") : ""}
                   {data.estimated_change != null ? Math.abs(data.estimated_change).toFixed(2) : "0.00"}%
@@ -773,7 +775,8 @@ export default function Home() {
 
               {/* CTA */}
               <a
-                href={`mailto:${SALES_EMAIL}?subject=预约 AI 深度诊断&body=我想预约体验基金透视 AI 深度诊断功能`}
+                href="https://wj.qq.com/s2/26732651/2402/"
+                target="_blank"
                 style={{
                   display: "flex", alignItems: "center", justifyContent: "center", gap: "0.5rem",
                   padding: "0.65rem 1rem",
@@ -784,7 +787,7 @@ export default function Home() {
                   boxShadow: "0 0 20px rgba(139,92,246,0.3)",
                 }}
               >
-                立即预约体验 → {SALES_EMAIL}
+                加入等待名单 →
               </a>
             </div>
           )}
@@ -848,6 +851,12 @@ export default function Home() {
                 <a style={styles.mvpBannerLink} href={`mailto:${SALES_EMAIL}`}>
                   {SALES_EMAIL}
                 </a>
+                {" "}
+                <Copy
+                  size={11}
+                  style={{ cursor: "pointer", display: "inline-block", verticalAlign: "middle", marginLeft: "2px", color: "#3b82f6" }}
+                  onClick={() => { navigator.clipboard.writeText(SALES_EMAIL); showBubble("邮箱已复制"); }}
+                />
               </>
             ) : (
               "。"
